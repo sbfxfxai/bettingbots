@@ -1,0 +1,2280 @@
+#!/usr/bin/env node
+// ─── DraftKings Live Winner Parlay Bot ──────────────────────────────────────
+// Every 3 minutes: scan all live sports, pick the current winner (ML) of each
+// game, add up to 20 legs to the bet slip, switch to Parlay, wager $0.10,
+// place the bet, repeat.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import puppeteer from 'puppeteer-core';
+import { resolve } from 'path';
+import { mkdirSync, appendFileSync } from 'fs';
+import { execSync, spawn } from 'child_process';
+
+// ─── Config ──────────────────────────────────────────────────────────────────
+const CHROME_PATH   = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
+const DEBUG_PORT    = 9223;
+const USER_DATA_DIR = resolve('./browser-data-draftkings');
+const SCREENSHOTS   = resolve('./screenshots-parlay');
+const PARLAY_WAGER  = 0.10;
+const MAX_LEGS      = 20;
+const SCAN_INTERVAL = 1 * 60 * 1000; // 1 minute (O/U scan)
+const STRUCTURED_INTERVAL = 30 * 60 * 1000; // 30 minutes (structured/OU/spread scans)
+const STRUCTURED_LEG_COUNTS = [2, 3, 5, 8];
+const PARLAY_LOG    = resolve('./parlay-history.jsonl');
+const DK_EMAIL      = 'pamo8020@gmail.com';
+const DK_PASSWORD   = '$Richpamo12';
+
+mkdirSync(SCREENSHOTS, { recursive: true });
+
+// ─── O/U EV Model (research-backed: Banker, Peterson, Alameda-Basora) ────────
+// Sport-specific thresholds (Banker: 6pts NFL ≈ 5–8pts NBA; scaled per sport)
+const OU_THRESHOLDS = {
+  BASKETBALL:   5,    // ~5 points (NBA/college)
+  HOCKEY:       0.8,  // ~1 goal
+  HANDBALL:     2.5,  // ~2-3 goals
+  SOCCER:       0.5,  // ~0.5 goals
+  BASEBALL:     1.2,  // ~1 run
+  VOLLEYBALL:   0,    // set-based — skip EV (bet all)
+  TENNIS:       0,    // set-based — skip EV (bet all)
+  TABLE_TENNIS: 0,    // set-based — skip EV (bet all)
+  CRICKET:      0,    // skip EV
+  BADMINTON:    0,    // skip EV
+};
+
+function parseClockToSeconds(clock) {
+  if (!clock) return null;
+  const m = String(clock).match(/(\d{1,2}):(\d{2})/);
+  if (!m) return null;
+  return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+}
+
+// Estimate how far through the game we are (0.0 = start, 1.0 = end)
+function estimateGameProgress(sport, period, clock) {
+  const p = String(period || '').toLowerCase();
+  const clockSec = parseClockToSeconds(clock);
+  const sportKey = (sport || '').toUpperCase().replace(/\s+/g, '_');
+
+  if (sportKey === 'BASKETBALL' || sportKey.includes('BASKET')) {
+    // Quarters: 12 min each (NBA), or halves: 20 min each (college/Euro)
+    let qNum = null;
+    if (p.includes('1st') && p.includes('quarter')) qNum = 1;
+    else if (p.includes('2nd') && p.includes('quarter')) qNum = 2;
+    else if (p.includes('3rd') && p.includes('quarter')) qNum = 3;
+    else if (p.includes('4th') && p.includes('quarter')) qNum = 4;
+    else if (p.includes('ot') || p.includes('overtime')) return 0.95;
+    else if (p.includes('half')) {
+      // College/Euro: 2 halves × 20 min
+      const halfNum = p.includes('1st') ? 1 : 2;
+      const halfLen = 20 * 60;
+      const remain = clockSec != null ? clockSec : halfLen / 2;
+      const elapsed = ((halfNum - 1) * halfLen) + (halfLen - remain);
+      return Math.min(0.99, Math.max(0.05, elapsed / (2 * halfLen)));
+    }
+    if (qNum == null) return 0.5;
+    const qLen = 12 * 60;
+    const remain = clockSec != null ? clockSec : qLen / 2;
+    const elapsed = ((qNum - 1) * qLen) + (qLen - remain);
+    return Math.min(0.99, Math.max(0.05, elapsed / (4 * qLen)));
+  }
+
+  if (sportKey === 'HOCKEY' || sportKey.includes('HOCK')) {
+    let pNum = null;
+    if (p.includes('1st')) pNum = 1;
+    else if (p.includes('2nd')) pNum = 2;
+    else if (p.includes('3rd')) pNum = 3;
+    else if (p.includes('ot') || p.includes('overtime')) return 0.95;
+    if (pNum == null) return 0.5;
+    const pLen = 20 * 60;
+    const remain = clockSec != null ? clockSec : pLen / 2;
+    const elapsed = ((pNum - 1) * pLen) + (pLen - remain);
+    return Math.min(0.99, Math.max(0.05, elapsed / (3 * pLen)));
+  }
+
+  if (sportKey === 'HANDBALL' || sportKey.includes('HAND')) {
+    const halfNum = p.includes('2nd') ? 2 : 1;
+    const halfLen = 30 * 60;
+    const remain = clockSec != null ? clockSec : halfLen / 2;
+    const elapsed = ((halfNum - 1) * halfLen) + (halfLen - remain);
+    return Math.min(0.99, Math.max(0.05, elapsed / (2 * halfLen)));
+  }
+
+  if (sportKey === 'SOCCER' || sportKey.includes('SOCC') || sportKey.includes('FOOT')) {
+    const halfNum = p.includes('2nd') ? 2 : 1;
+    const halfLen = 45 * 60;
+    const remain = clockSec != null ? clockSec : halfLen / 2;
+    const elapsed = ((halfNum - 1) * halfLen) + (halfLen - remain);
+    return Math.min(0.99, Math.max(0.05, elapsed / (2 * halfLen)));
+  }
+
+  if (sportKey === 'BASEBALL' || sportKey.includes('BASE')) {
+    // Innings: top/bot 1st-9th
+    let inning = 1;
+    const im = p.match(/(\d+)/);
+    if (im) inning = parseInt(im[1], 10);
+    const isBot = p.includes('bot') || p.includes('bottom') || p.includes('mid');
+    const halfInnings = ((inning - 1) * 2) + (isBot ? 1 : 0);
+    return Math.min(0.99, Math.max(0.05, halfInnings / 18));
+  }
+
+  return 0.5; // Unknown sport — assume mid-game
+}
+
+// Calculate O/U edge: positive = OVER edge, negative = UNDER edge
+// Returns { side: 'OVER'|'UNDER'|null, delta, projected, threshold }
+function calculateOUEdge(sport, score1, score2, totalLine, period, clock) {
+  const sportKey = (sport || '').toUpperCase().replace(/\s+/g, '_');
+  const threshold = OU_THRESHOLDS[sportKey] || 0;
+  const s1 = parseInt(score1 || '0', 10) || 0;
+  const s2 = parseInt(score2 || '0', 10) || 0;
+  const line = parseFloat(totalLine) || 0;
+  if (line <= 0) return { side: null, delta: 0, projected: 0, threshold };
+
+  const currentTotal = s1 + s2;
+  const progress = estimateGameProgress(sport, period, clock);
+
+  // Pace decay: scoring slows ~2% per quarter-equivalent (Alameda-Basora)
+  const quarterEquiv = Math.max(1, Math.ceil(progress * 4));
+  const paceDecayFactor = 1 - (0.02 * (quarterEquiv - 1));
+  const remainingProgress = 1 - progress;
+  const currentPace = progress > 0.05 ? currentTotal / progress : line;
+  const projectedRemaining = currentPace * remainingProgress * paceDecayFactor;
+  const projectedFinalTotal = currentTotal + projectedRemaining;
+  const delta = projectedFinalTotal - line;
+
+  // Q2 bonus for basketball (Alameda-Basora: Q2 totals most profitable, 10% ROI)
+  const q2Bonus = (sportKey.includes('BASKET') && quarterEquiv === 2) ? 1.15 : 1.0;
+  const adjustedDelta = delta * q2Bonus;
+
+  // No threshold for set-based sports — always bet (use OVER as default)
+  if (threshold === 0) {
+    return {
+      side: adjustedDelta >= 0 ? 'OVER' : 'UNDER',
+      delta: adjustedDelta, projected: projectedFinalTotal, threshold,
+    };
+  }
+
+  // Only bet when delta exceeds threshold (Banker: selective betting flips negative ROI to positive)
+  if (adjustedDelta > threshold) {
+    return { side: 'OVER', delta: adjustedDelta, projected: projectedFinalTotal, threshold };
+  }
+  if (adjustedDelta < -threshold) {
+    return { side: 'UNDER', delta: adjustedDelta, projected: projectedFinalTotal, threshold };
+  }
+  return { side: null, delta: adjustedDelta, projected: projectedFinalTotal, threshold };
+}
+
+const SPORTS = [
+  { name: 'BASKETBALL', url: 'https://sportsbook.draftkings.com/live?category=live-in-game&subcategory=basketball' },
+  { name: 'BASEBALL',   url: 'https://sportsbook.draftkings.com/live?category=live-in-game&subcategory=baseball' },
+  { name: 'FOOTBALL',   url: 'https://sportsbook.draftkings.com/live?category=live-in-game&subcategory=football' },
+];
+
+const SEL = {
+  gameBlock:       '.cb-market__template',
+  gameBlockFilter: '.cb-market__label-inner',
+  teamName:        '.cb-market__label-inner',
+  score:           '.cb-market__scoreboard-team-score',
+  oddsButton:      'button.cb-market__button',
+  oddsValue:       '.cb-market__button-odds',
+  oddsPoints:      '.cb-market__button-points',
+  oddsTitle:       '.cb-market__button-title',
+  period:          '.cb-event-cell__period',
+  clock:           '.cb-event-cell__time',
+  collapsed:       'button.lp-collapsible-section[aria-expanded="false"], button[aria-expanded="false"].sportsbook-collapsible-section, [data-testid*="collapsed"], .sportsbook-expandable-header[aria-expanded="false"]',
+  leagueHeading:   '.sportsbook-collapsible-section__title, .lp-collapsible-section__title, [data-testid*="league"], [data-testid*="competition"], .cb-event-group__title, .sportsbook-event-group__title',
+};
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
+function logBet(msg) { console.log(`[${new Date().toISOString()}] 🎲 ${msg}`); }
+
+function parseAmericanOdds(str) {
+  if (!str) return NaN;
+  // Normalise Unicode minus (−, U+2212) and en-dash to ASCII minus
+  const norm = str.replace(/[\u2212\u2013]/g, '-').trim();
+  const n = parseInt(norm.replace(/[^\-\d]/g, ''), 10);
+  return isNaN(n) ? NaN : n;
+}
+
+async function screenshot(page, tag) {
+  try {
+    const name = `${new Date().toISOString().replace(/[:.]/g, '-')}-${tag}.png`;
+    await page.screenshot({ path: resolve(SCREENSHOTS, name), fullPage: false });
+  } catch {}
+}
+
+// ─── Login ──────────────────────────────────────────────────────────────────
+
+// Login check — detects DraftKings logged-in state via page text and elements
+async function isLoggedIn(page) {
+  const result = await page.evaluate(() => {
+    const text = (document.body?.innerText || '').toLowerCase();
+    if (text.length < 100) return { logged: false, reason: 'page_too_short', len: text.length };
+
+    // NEGATIVE — if ANY of these exist, definitely NOT logged in
+    const negatives = [
+      'log in to place bets', 'sign in to place bets',
+      'log in to place', 'sign in to place',
+      'want to start placing bets', 'must be logged in',
+      'sign in to your account', 'log in to your account',
+      'sign in to get started',
+    ];
+    const negHit = negatives.find(p => text.includes(p));
+    if (negHit) return { logged: false, reason: `negative: "${negHit}"` };
+
+    // Check for visible "Sign In" / "Log In" buttons (NOT "Join Now" — that appears in promos even when logged in)
+    for (const el of document.querySelectorAll('a, button, span')) {
+      const t = (el.textContent || '').trim().toLowerCase();
+      if (t.length > 20) continue;
+      if (t === 'sign in' || t === 'log in') {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          return { logged: false, reason: `button: "${t}" (${el.tagName})` };
+        }
+      }
+    }
+
+    // POSITIVE checks — DraftKings specific
+    // 1. Balance with dollar amount (e.g. "Balance$22.94" or "balance\n$22.94")
+    if (/balance[^a-z]*\$\d+/i.test(document.body?.innerText || '')) {
+      return { logged: true, reason: 'balance_dollar' };
+    }
+    // 2. "My Bets" link exists AND no "sign in"/"log in" text anywhere
+    if (text.includes('my bets') && !text.includes('sign in') && !text.includes('log in')) {
+      return { logged: true, reason: 'my_bets_no_signin' };
+    }
+    // 3. "Last Login:" text (only shown in footer when logged in)
+    if (text.includes('last login:')) {
+      return { logged: true, reason: 'last_login_text' };
+    }
+    // 4. "Sign Out" / "Log Out" element
+    for (const el of document.querySelectorAll('a, button, span, div')) {
+      const t = (el.textContent || '').trim().toLowerCase();
+      if (t.length > 20) continue;
+      if (t === 'sign out' || t === 'log out' || t === 'logout' || t === 'signout') {
+        return { logged: true, reason: `found: "${t}"` };
+      }
+    }
+    // 5. "Deposit" link + large page + no sign-in text
+    if (text.length > 2000 && text.includes('deposit') && !text.includes('sign in') && !text.includes('log in')) {
+      return { logged: true, reason: 'deposit_no_signin' };
+    }
+
+    return { logged: false, reason: 'no_indicator', len: text.length };
+  }).catch(() => ({ logged: false, reason: 'error' }));
+
+  if (result.logged) {
+    log(`  🔓 isLoggedIn=true (${result.reason})`);
+  }
+  return result.logged;
+}
+
+// Detect explicit "not logged in" state
+async function detectNotLoggedIn(page) {
+  return page.evaluate(() => {
+    const text = (document.body?.innerText || '').toLowerCase();
+    if (text.length < 50) return { notLoggedIn: false, loading: true };
+    // Check small leaf elements for sign-in buttons
+    for (const el of document.querySelectorAll('a, button, span')) {
+      const t = (el.textContent || '').trim().toLowerCase();
+      if (t.length > 30) continue;
+      if (t === 'sign in' || t === 'log in' || t === 'sign up' || t === 'create account') {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) return { notLoggedIn: true, reason: t };
+      }
+    }
+    if (/want to start placing bets|sign in to|must be logged in/i.test(text)) {
+      return { notLoggedIn: true, reason: 'text_prompt' };
+    }
+    return { notLoggedIn: false, loading: text.length < 500 };
+  }).catch(() => ({ notLoggedIn: false, loading: true }));
+}
+
+// Perform the actual login flow (DOM + keyboard fallback)
+async function performLogin(page) {
+  // Navigate to login page if not already there
+  const currentUrl = page.url();
+  const onLoginPage = currentUrl.includes('auth/login') || currentUrl.includes('auth/signup') ||
+    currentUrl.includes('myaccount.draftkings.com');
+  if (!onLoginPage) {
+    log('  Clicking "Sign In" to open login page...');
+    try {
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
+        page.evaluate(() => {
+          for (const el of document.querySelectorAll('a, button, span')) {
+            const t = (el.textContent || '').trim().toLowerCase();
+            if (t === 'sign in' || t === 'log in') { el.click(); return true; }
+          }
+          return false;
+        })
+      ]);
+    } catch {}
+    await new Promise(r => setTimeout(r, 3000));
+  }
+
+  // Wait for any login input to appear (up to 20s)
+  log('  Waiting for login form...');
+  let formFound = false;
+  for (let w = 0; w < 20; w++) {
+    formFound = await page.evaluate(() => {
+      return !!(document.querySelector('#login-username-input') ||
+        document.querySelector('input[type="email"]') ||
+        document.querySelector('input[name="Email"]') ||
+        document.querySelector('input[autocomplete="email"]') ||
+        document.querySelector('input[autocomplete="username"]') ||
+        document.querySelector('input[type="text"]'));
+    }).catch(() => false);
+    if (formFound) break;
+    await new Promise(r => setTimeout(r, 1000));
+  }
+
+  await screenshot(page, 'pre-login');
+
+  // --- Method 1: DOM-based with React setter (most reliable for DK) ---
+  let domLoginOk = false;
+  const emailFilled = await page.evaluate((email) => {
+    // Try specific DK selectors first, then broader ones
+    const selectors = [
+      '#login-username-input',
+      'input[type="email"]',
+      'input[name="Email"]',
+      'input[autocomplete="email"]',
+      'input[autocomplete="username"]',
+    ];
+    for (const sel of selectors) {
+      const input = document.querySelector(sel);
+      if (!input) continue;
+      const rect = input.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+      input.focus(); input.value = '';
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(input, email);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      return sel;
+    }
+    // Broader fallback: find by placeholder/label
+    for (const input of document.querySelectorAll('input[type="text"], input[type="email"]')) {
+      const ph = (input.placeholder || '').toLowerCase();
+      const label = (input.getAttribute('aria-label') || '').toLowerCase();
+      if (ph.includes('email') || ph.includes('username') || label.includes('email')) {
+        input.focus(); input.value = '';
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        setter.call(input, email);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        return 'placeholder-match';
+      }
+    }
+    return null;
+  }, DK_EMAIL).catch(() => null);
+
+  if (emailFilled) {
+    log(`  Email filled via: ${emailFilled}`);
+    await new Promise(r => setTimeout(r, 500));
+
+    // Fill password
+    const pwFilled = await page.evaluate((pw) => {
+      const input = document.querySelector('#login-password-input') ||
+        document.querySelector('input[type="password"]');
+      if (!input) return false;
+      input.focus(); input.value = '';
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(input, pw);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    }, DK_PASSWORD).catch(() => false);
+
+    if (pwFilled) {
+      log('  Password filled — clicking submit...');
+      await new Promise(r => setTimeout(r, 300));
+      try {
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
+          page.evaluate(() => {
+            for (const el of document.querySelectorAll('button[type="submit"], button')) {
+              const text = (el.textContent || '').trim().toLowerCase();
+              if (text === 'log in' || text === 'sign in' || text === 'submit' || text === 'login') {
+                el.click(); return true;
+              }
+            }
+            return false;
+          })
+        ]);
+      } catch {}
+      domLoginOk = true;
+      log('  DOM login submitted');
+    }
+  }
+
+  // --- Method 2: Keyboard fallback ---
+  if (!domLoginOk) {
+    log('  DOM login failed — trying keyboard login...');
+    // Try to find and click the first visible text/email input
+    const inputClicked = await page.evaluate(() => {
+      for (const input of document.querySelectorAll('input[type="email"], input[type="text"], input[autocomplete="email"], input[autocomplete="username"]')) {
+        const rect = input.getBoundingClientRect();
+        if (rect.width > 30 && rect.height > 10) {
+          input.focus(); input.click();
+          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+        }
+      }
+      return null;
+    }).catch(() => null);
+
+    if (inputClicked) {
+      await page.mouse.click(inputClicked.x, inputClicked.y);
+      await new Promise(r => setTimeout(r, 300));
+      // Select all + delete to clear
+      await page.keyboard.down('Control');
+      await page.keyboard.press('a');
+      await page.keyboard.up('Control');
+      await page.keyboard.press('Backspace');
+      await new Promise(r => setTimeout(r, 200));
+      await page.keyboard.type(DK_EMAIL, { delay: 20 });
+      log('  Typed email');
+      await new Promise(r => setTimeout(r, 300));
+      await page.keyboard.press('Tab');
+      await new Promise(r => setTimeout(r, 300));
+      // Clear password field too
+      await page.keyboard.down('Control');
+      await page.keyboard.press('a');
+      await page.keyboard.up('Control');
+      await page.keyboard.press('Backspace');
+      await new Promise(r => setTimeout(r, 200));
+      await page.keyboard.type(DK_PASSWORD, { delay: 20 });
+      log('  Typed password');
+      await new Promise(r => setTimeout(r, 500));
+      await page.keyboard.press('Enter');
+      log('  Keyboard login submitted');
+    } else {
+      log('  ⚠️ No login input found at all');
+    }
+  }
+
+  // Wait for login to process
+  await new Promise(r => setTimeout(r, 10000));
+  await screenshot(page, 'post-login');
+
+  // After login, navigate back to /live if redirected elsewhere
+  if (!page.url().includes('sportsbook.draftkings.com/live')) {
+    log('  Navigating back to /live after login...');
+    try {
+      await page.goto('https://sportsbook.draftkings.com/live', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    } catch {}
+    await new Promise(r => setTimeout(r, 5000));
+  }
+}
+
+async function ensureLoggedIn(page, forceReload = false) {
+  log('🔑 Checking login status...');
+
+  for (let attempt = 0; attempt < 15; attempt++) {
+    // Reload on first attempt if forced (startup)
+    if (attempt === 0 && forceReload) {
+      try { await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+      await new Promise(r => setTimeout(r, 5000));
+    }
+
+    // Check if logged in (strict check)
+    const loggedIn = await isLoggedIn(page);
+    if (loggedIn) {
+      log('✅ Logged in to DraftKings — confirmed');
+      return true;
+    }
+
+    // Check if page shows login prompt OR is ambiguous
+    const detection = await detectNotLoggedIn(page);
+    log(`  Login attempt ${attempt + 1}/15: notLoggedIn=${detection.notLoggedIn}, reason=${detection.reason || 'n/a'}, loading=${detection.loading || false}`);
+
+    if (detection.notLoggedIn) {
+      // Definite: not logged in → auto-login
+      await performLogin(page);
+      await new Promise(r => setTimeout(r, 3000));
+      if (await isLoggedIn(page)) {
+        log('✅ Logged in to DraftKings — confirmed after auto-login');
+        return true;
+      }
+      log('  Auto-login attempt did not succeed — retrying...');
+
+    } else if (detection.loading) {
+      // Page still loading — fire-and-forget navigation to DK (don't block on timeout)
+      if (attempt === 3 || attempt === 7 || attempt === 11) {
+        log('  Page still loading — retrying navigation to DraftKings live...');
+        page.goto('https://sportsbook.draftkings.com/live').catch(() => {});
+      }
+      await new Promise(r => setTimeout(r, 5000));
+
+    } else {
+      // Ambiguous: page loaded, no "Sign In" button found, but no "Sign Out" either
+      // This means we're probably NOT logged in — try logging in
+      log('  Ambiguous state (no sign-in button, no sign-out either) — attempting login...');
+      await performLogin(page);
+      await new Promise(r => setTimeout(r, 3000));
+      if (await isLoggedIn(page)) {
+        log('✅ Logged in to DraftKings — confirmed after login');
+        return true;
+      }
+    }
+  }
+
+  // Auto-login exhausted — prompt user for manual login
+  log('');
+  log('╔══════════════════════════════════════════════════════╗');
+  log('║  ⚠️  AUTO-LOGIN FAILED — MANUAL LOGIN REQUIRED      ║');
+  log('║  Please log in to DraftKings in the Chrome window.  ║');
+  log('║  The bot will resume once login is detected.        ║');
+  log('╚══════════════════════════════════════════════════════╝');
+  log('');
+  await screenshot(page, 'manual-login-needed');
+
+  // Poll for manual login (up to 10 minutes)
+  for (let w = 0; w < 120; w++) {
+    if (await isLoggedIn(page)) {
+      log('✅ Manual login detected — resuming bot');
+      return true;
+    }
+    if (w % 12 === 0 && w > 0) log(`  Still waiting for manual login... (${w * 5}s)`);
+    await new Promise(r => setTimeout(r, 5000));
+  }
+  log('❌ Login timed out after 10 minutes');
+  return false;
+}
+
+// ─── Browser ─────────────────────────────────────────────────────────────────
+
+const CHROME_ARGS = [
+  `--remote-debugging-port=${DEBUG_PORT}`,
+  `--user-data-dir=${USER_DATA_DIR}`,
+  '--no-first-run', '--no-default-browser-check',
+  '--disable-popup-blocking',
+  '--disable-default-apps', '--disable-sync',
+  '--window-size=1280,900',
+  // Allow GeoComply loopback access (wss.plc-gc.com → 127.0.0.1)
+  '--disable-features=BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessRespectPreflightResults,PrivateNetworkAccessChecks,PrivateNetworkAccessForWorkers,PrivateNetworkAccessForNavigations',
+];
+
+function killChromeOnPort() {
+  try {
+    const out = execSync(
+      `netstat -ano | findstr ":${DEBUG_PORT}" | findstr "LISTENING"`,
+      { encoding: 'utf8', timeout: 5000 }
+    ).trim();
+    const pids = new Set();
+    for (const line of out.split('\n')) {
+      const parts = line.trim().split(/\s+/);
+      const pid = parts[parts.length - 1];
+      if (pid && /^\d+$/.test(pid) && pid !== '0') pids.add(pid);
+    }
+    for (const pid of pids) {
+      log(`Killing Chrome (PID ${pid}) on port ${DEBUG_PORT}...`);
+      try { execSync(`taskkill /F /PID ${pid}`, { timeout: 5000 }); } catch {}
+    }
+    return pids.size;
+  } catch {
+    return 0;
+  }
+}
+
+// Spawn Chrome as a DETACHED process (survives bot restarts)
+function spawnDetachedChrome(url) {
+  const args = [...CHROME_ARGS];
+  if (url) args.push(url);
+  const proc = spawn(CHROME_PATH, args, { stdio: 'ignore', detached: true });
+  proc.unref(); // Let Chrome outlive this process
+  return proc;
+}
+
+async function connectBrowser() {
+  let browser;
+
+  // Try connecting to existing Chrome (fast — preserves session + warm connections)
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      browser = await puppeteer.connect({ browserURL: `http://127.0.0.1:${DEBUG_PORT}`, defaultViewport: null });
+      log('Connected to existing Chrome on port ' + DEBUG_PORT);
+      break;
+    } catch {
+      if (attempt === 0) {
+        log('No Chrome found — spawning detached Chrome with CORS flags...');
+        spawnDetachedChrome('https://sportsbook.draftkings.com/live');
+        log('Chrome spawned — waiting for debug port...');
+        await new Promise(r => setTimeout(r, 5000));
+      } else {
+        log(`  Connect retry ${attempt + 1}/3...`);
+        await new Promise(r => setTimeout(r, 3000));
+      }
+    }
+  }
+
+  if (!browser) {
+    log('Still cannot connect — killing stale Chrome and respawning...');
+    killChromeOnPort();
+    await new Promise(r => setTimeout(r, 3000));
+    spawnDetachedChrome('https://sportsbook.draftkings.com/live');
+    await new Promise(r => setTimeout(r, 6000));
+    browser = await puppeteer.connect({ browserURL: `http://127.0.0.1:${DEBUG_PORT}`, defaultViewport: null });
+    log('Connected after respawn');
+  }
+
+  // Find or create a page
+  const pages = await browser.pages();
+  let page = pages.find(p => {
+    try { return !p.isClosed() && p.url().includes('draftkings.com'); } catch { return false; }
+  });
+  if (!page) {
+    page = pages.find(p => { try { return !p.isClosed(); } catch { return false; } });
+    if (!page) page = await browser.newPage();
+  }
+
+  page.setDefaultNavigationTimeout(60000);
+  page.setDefaultTimeout(30000);
+
+  return { browser, page };
+}
+
+// ─── Page Health & Location ──────────────────────────────────────────────────
+
+// Quick check: is the location banner currently blocking?
+async function isLocationBlocked(page) {
+  return page.evaluate(() => {
+    const t = (document.body?.innerText || '').toLowerCase();
+    // Check text indicators
+    if (t.includes('trouble verifying your location') ||
+        t.includes('verifying your location') ||
+        t.includes('you are in a location where betting is unavailable') ||
+        t.includes('checking location') ||
+        t.includes('location where betting')) return true;
+    // Check for the blue/yellow location banner element (may not be in innerText if floating)
+    for (const el of document.querySelectorAll('div, section, aside, [role="alert"], [role="banner"], span, p')) {
+      const text = (el.textContent || '').trim().toLowerCase();
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 200 || rect.height < 20 || rect.height > 120) continue;
+      if (text.includes('trouble verifying') || text.includes('verifying your location') ||
+          text.includes('required to bet') || text.includes('location where betting')) {
+        return true;
+      }
+    }
+    return false;
+  }).catch(() => true); // assume blocked on error
+}
+
+// Click the location recheck banner/arrow using REAL mouse click (DOM .click() doesn't trigger it)
+async function clickRecheckLocation(page) {
+  // Find the blue banner's bounding box
+  const bannerInfo = await page.evaluate(() => {
+    // Look for the blue location banner
+    for (const el of document.querySelectorAll('div, section, aside, a, [role="alert"], [role="banner"]')) {
+      const text = (el.textContent || '').toLowerCase();
+      if (!text.includes('location') && !text.includes('verifying')) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.height < 10 || rect.height > 200 || rect.width < 200) continue;
+      if (rect.y < 0 || rect.y > 500) continue;
+      return { x: rect.x, y: rect.y, w: rect.width, h: rect.height, tag: el.tagName };
+    }
+    return null;
+  }).catch(() => null);
+
+  if (!bannerInfo) {
+    log('  No location banner found in DOM');
+    return null;
+  }
+
+  // Real mouse click on the ">" arrow (right side of the blue banner)
+  const clickX = bannerInfo.x + bannerInfo.w - 30; // near the right arrow
+  const clickY = bannerInfo.y + bannerInfo.h / 2;   // vertically centered
+  log(`  Clicking banner arrow at (${Math.round(clickX)}, ${Math.round(clickY)}) [${bannerInfo.tag} ${bannerInfo.w}x${bannerInfo.h}]`);
+  await page.mouse.click(clickX, clickY);
+  await new Promise(r => setTimeout(r, 2000));
+
+  // Also try clicking the banner center as backup
+  const centerX = bannerInfo.x + bannerInfo.w / 2;
+  await page.mouse.click(centerX, clickY);
+
+  log('  Location recheck clicked (mouse)');
+  // Wait for GeoComply to process
+  await new Promise(r => setTimeout(r, 8000));
+
+  // Navigate back to /live if needed
+  if (!page.url().includes('/live')) {
+    try { await page.goto('https://sportsbook.draftkings.com/live?category=live-in-game&subcategory=basketball', { waitUntil: 'domcontentloaded', timeout: 20000 }); } catch {}
+    await new Promise(r => setTimeout(r, 5000));
+  }
+  return 'mouse';
+}
+
+// Ensure location is verified — NEVER gives up, loops forever until verified
+async function ensureLocationVerified(page) {
+  let attempt = 0;
+  while (true) {
+    const blocked = await isLocationBlocked(page);
+    if (!blocked) return true;
+    attempt++;
+    const phase = ((attempt - 1) % 4) + 1; // cycles 1→2→3→4→1→2→3→4…
+    log(`⚠️ Location blocked (attempt ${attempt}, strategy ${phase}/4)`);
+    if (attempt <= 3 || attempt % 5 === 0) await screenshot(page, `location-recheck-${attempt}`);
+
+    if (phase === 1) {
+      // Phase 1: click recheck button
+      log('  Clicking recheck...');
+      const clicked = await clickRecheckLocation(page);
+      if (!clicked) log('  No recheck element found');
+      await new Promise(r => setTimeout(r, 5000));
+
+    } else if (phase === 2) {
+      // Phase 2: hard page reload to reset GeoComply
+      log('  🔄 Hard reload to reset GeoComply...');
+      try { await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+      await new Promise(r => setTimeout(r, 12000));
+
+    } else if (phase === 3) {
+      // Phase 3: navigate completely away then back
+      log('  🔄 Full re-navigation to reset location...');
+      try { await page.goto('https://sportsbook.draftkings.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+      await new Promise(r => setTimeout(r, 8000));
+      try { await page.goto('https://sportsbook.draftkings.com/live?category=live-in-game&subcategory=basketball', { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+      await new Promise(r => setTimeout(r, 12000));
+
+    } else {
+      // Phase 4: click recheck + longer cool-down before cycling back
+      log('  Clicking recheck + cool-down before next cycle...');
+      await clickRecheckLocation(page);
+      await new Promise(r => setTimeout(r, 15000));
+    }
+  }
+}
+
+// Navigate to DK and wait for content — uses fire-and-forget nav to avoid blocking timeouts
+async function ensurePageLoaded(page) {
+  const currentUrl = page.url();
+  const onDK = currentUrl.includes('sportsbook.draftkings.com');
+  const isBlank = currentUrl === 'about:blank' || currentUrl.startsWith('chrome-error://') || currentUrl === 'chrome://newtab/';
+
+  // Check current content
+  const contentLen = await page.evaluate(() => (document.body?.innerText || '').length).catch(() => 0);
+
+  if (!onDK || isBlank) {
+    log(`Navigating to DK live (current: ${isBlank ? 'blank' : currentUrl.substring(0, 60)})...`);
+    page.goto('https://sportsbook.draftkings.com/live').catch(() => {});
+  } else if (contentLen < 200) {
+    log('On DK but page is nearly empty — triggering reload...');
+    page.reload().catch(() => {});
+  } else {
+    log(`On DK with content (${contentLen} chars)`);
+    return true;
+  }
+
+  // Poll for content (up to 90s — DK SPA can be very slow on first load)
+  for (let w = 0; w < 45; w++) {
+    const len = await page.evaluate(() => {
+      const text = document.body?.innerText || '';
+      if (/ERR_|DNS_|INTERNET_DISCONNECTED|This site can.t be reached/i.test(text)) return -1;
+      return text.length;
+    }).catch(() => 0);
+
+    if (len > 500) {
+      log(`Page loaded (${len} chars)`);
+      return true;
+    }
+    if (len === -1) {
+      log('  Error page detected — retrying navigation...');
+      page.goto('https://sportsbook.draftkings.com/live').catch(() => {});
+    }
+    if (w === 20) {
+      log('  Still loading after 40s — retrying navigation...');
+      page.goto('https://sportsbook.draftkings.com/live').catch(() => {});
+    }
+    if (w % 10 === 0 && w > 0) log(`  Waiting for page content... (${w * 2}s)`);
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  log('⚠️ Page still not loaded after 90s');
+  return false;
+}
+
+async function verifyLocation(page) {
+  // Step 1: Make sure the page is loaded with real content
+  const loaded = await ensurePageLoaded(page);
+  if (!loaded) return false;
+
+  // Step 2: Check and resolve location — loops forever until verified
+  await ensureLocationVerified(page);
+  log('✅ Location verified');
+  return true;
+}
+
+// ─── Scrape Live Games ───────────────────────────────────────────────────────
+async function scrapeGames(page) {
+  // Expand collapsed sections first
+  await page.evaluate((sel) => {
+    document.querySelectorAll(sel).forEach(btn => btn.click());
+  }, SEL.collapsed).catch(() => {});
+  await new Promise(r => setTimeout(r, 150));
+
+  // DK uses virtualized rendering — only visible games exist in the DOM.
+  // Scroll through the page and accumulate games at each viewport position.
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  await new Promise(r => setTimeout(r, 100));
+
+  const allGames = [];
+  const seenKeys = new Set();
+
+  let noNewCount = 0;
+  for (let scrollPass = 0; scrollPass < 30; scrollPass++) {
+    // Expand any newly revealed collapsed sections
+    await page.evaluate((sel) => {
+      document.querySelectorAll(sel).forEach(btn => btn.click());
+    }, SEL.collapsed).catch(() => {});
+
+    const viewportGames = await page.evaluate((sel) => {
+      const games = [];
+      const blocks = Array.from(document.querySelectorAll(sel.gameBlock))
+        .filter(b => b.querySelector(sel.gameBlockFilter));
+
+      blocks.forEach(block => {
+        const rect = block.getBoundingClientRect();
+        if (rect.x >= 700 || rect.width === 0) return;
+
+        const teamEls = block.querySelectorAll(sel.teamName);
+        const teamData = [];
+        teamEls.forEach(el => {
+          const name = (el.textContent || '').trim();
+          if (name && name.length > 1) {
+            const r = el.getBoundingClientRect();
+            teamData.push({ name, y: r.y + r.height / 2 });
+          }
+        });
+
+        const scoreEls = block.querySelectorAll(sel.score);
+        const scoreData = [];
+        scoreEls.forEach(el => {
+          const text = (el.textContent || '').trim();
+          const r = el.getBoundingClientRect();
+          if (text !== '' && text !== '-' && text !== '–' && text !== '—') scoreData.push({ text, y: r.y + r.height / 2, x: r.x });
+        });
+
+        let scores1 = [], scores2 = [];
+        if (teamData.length >= 2 && scoreData.length >= 2) {
+          const midY = (teamData[0].y + teamData[1].y) / 2;
+          for (const s of scoreData) {
+            if (s.y < midY) scores1.push(s);
+            else scores2.push(s);
+          }
+          scores1.sort((a, b) => a.x - b.x);
+          scores2.sort((a, b) => a.x - b.x);
+        } else if (scoreData.length >= 2) {
+          const half = Math.ceil(scoreData.length / 2);
+          scores1 = scoreData.slice(0, half);
+          scores2 = scoreData.slice(half);
+        }
+
+        const buttons = block.querySelectorAll(sel.oddsButton);
+        const odds = [];
+        buttons.forEach(btn => {
+          const oddsEl = btn.querySelector(sel.oddsValue) || btn;
+          const pointsEl = btn.querySelector(sel.oddsPoints);
+          const titleEl = btn.querySelector(sel.oddsTitle);
+          const oddsText = (oddsEl.textContent || '').trim();
+          odds.push({
+            value: oddsText,
+            points: pointsEl ? (pointsEl.textContent || '').trim() : '',
+            title: titleEl ? (titleEl.textContent || '').trim() : '',
+            idx: odds.length,
+          });
+        });
+
+        const moneylines = [];
+        odds.forEach(o => {
+          const t = (o.title || '').toUpperCase();
+          const p = (o.points || '').trim();
+          if (t === 'O' || t === 'U' || p.startsWith('+') || p.startsWith('-') ||
+              p.toUpperCase() === 'PK' || p.toUpperCase().startsWith('O ') || p.toUpperCase().startsWith('U ')) return;
+          moneylines.push(o);
+        });
+
+        const periodEl = block.querySelector(sel.period) || (block.parentElement && block.parentElement.querySelector(sel.period));
+        const clockEl = block.querySelector(sel.clock) || (block.parentElement && block.parentElement.querySelector(sel.clock));
+        const period = periodEl ? (periodEl.textContent || '').trim() : '';
+        const clock = clockEl ? (clockEl.textContent || '').trim() : '';
+
+        const score1Raw = scores1.map(s => s.text);
+        const score2Raw = scores2.map(s => s.text);
+        const hasScore = score1Raw.length > 0 || score2Raw.length > 0;
+        const isLive = hasScore || period || clock;
+
+        if (teamData.length >= 2 && isLive) {
+          // Filter out Draw/X for soccer 3-way ML, then take first=Home, last=Away
+          const drawTitles = ['X', 'DRAW', 'TIE', 'D'];
+          const nonDraw = moneylines.filter(o => !drawTitles.includes((o.title || '').toUpperCase()));
+          const ml1 = nonDraw[0] || null;
+          const ml2 = nonDraw.length >= 2 ? (nonDraw[nonDraw.length - 1] || null) : (nonDraw[0] === ml1 ? null : nonDraw[0] || null);
+
+          // Find nearest league heading above this block in the DOM
+          let league = '';
+          let el = block;
+          while (el && el !== document.body) {
+            el = el.parentElement;
+            if (!el) break;
+            const heading = el.querySelector(sel.leagueHeading);
+            if (heading) { league = (heading.textContent || '').trim(); break; }
+          }
+
+          games.push({
+            team1: teamData[0].name, team2: teamData[1].name,
+            score1: score1Raw[score1Raw.length - 1] || '0', score2: score2Raw[score2Raw.length - 1] || '0',
+            rawScores1: score1Raw, rawScores2: score2Raw,
+            period, clock,
+            ml1, ml2,
+            league,
+            oddsCount: odds.length, mlCount: moneylines.length,
+            allOdds: odds.slice(0, 20).map(o => `${o.value}|${o.points}|${o.title}`),
+          });
+        }
+      });
+      return games;
+    }, SEL).catch(() => []);
+
+    // Deduplicate and accumulate
+    const prevCount = allGames.length;
+    for (const g of viewportGames) {
+      const key = [g.team1, g.team2].sort().join('|').toLowerCase();
+      if (!seenKeys.has(key)) {
+        seenKeys.add(key);
+        allGames.push(g);
+      }
+    }
+
+    // Track if this pass found anything new
+    if (allGames.length === prevCount) noNewCount++;
+    else noNewCount = 0;
+    if (noNewCount >= 3) break;
+
+    // Scroll down by full viewport
+    const atBottom = await page.evaluate(() => {
+      if (!document.body) return true;
+      window.scrollBy(0, window.innerHeight * 0.8);
+      return window.scrollY + window.innerHeight >= document.body.scrollHeight - 50;
+    }).catch(() => true);
+    await new Promise(r => setTimeout(r, 250));
+
+    if (atBottom) break;
+  }
+
+  // Scroll back to top when done
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  return allGames;
+}
+
+// ─── Pick Winner ─────────────────────────────────────────────────────────────
+// Only returns the team/player that is currently WINNING. Tied games are skipped.
+// Sport-specific score parsing ensures accuracy across all sport types.
+function pickWinner(game, sport = '') {
+  const sportUp = (sport || '').toUpperCase();
+
+  // --- Parse primary scores based on sport ---
+  let s1, s2;
+
+  if (sportUp.includes('TABLE')) {
+    // Table Tennis: DK shows set scores + rightmost = sets won total
+    // Use rightmost raw score (sets won) for comparison
+    const r1 = game.rawScores1 || [];
+    const r2 = game.rawScores2 || [];
+    s1 = parseInt(r1[r1.length - 1] || game.score1 || '0', 10) || 0;
+    s2 = parseInt(r2[r2.length - 1] || game.score2 || '0', 10) || 0;
+  } else if (sportUp.includes('TENNIS')) {
+    // Tennis: DK shows [gamePoints, set1Games, set2Games, ...]
+    // Leftmost (green) = current game points (0,15,30,40,AD) — skip it
+    // Remaining = games per set — count completed sets to determine leader
+    const r1 = (game.rawScores1 || []).map(v => parseInt(v, 10));
+    const r2 = (game.rawScores2 || []).map(v => parseInt(v, 10));
+    // Skip first element (game points) if there are multiple scores
+    const sets1 = r1.length > 1 ? r1.slice(1) : r1;
+    const sets2 = r2.length > 1 ? r2.slice(1) : r2;
+    let won1 = 0, won2 = 0;
+    for (let i = 0; i < Math.min(sets1.length, sets2.length); i++) {
+      const g1 = sets1[i], g2 = sets2[i];
+      if (isNaN(g1) || isNaN(g2)) continue;
+      // Set complete: one player has ≥6 games and leads by ≥2, or tiebreak 7-6
+      if ((g1 >= 6 && g1 - g2 >= 2) || (g1 === 7 && g2 === 6)) won1++;
+      else if ((g2 >= 6 && g2 - g1 >= 2) || (g2 === 7 && g1 === 6)) won2++;
+    }
+    s1 = won1; s2 = won2;
+    // If sets tied, use current set games as tiebreaker
+    if (s1 === s2 && sets1.length > 0 && sets2.length > 0) {
+      const curG1 = sets1[sets1.length - 1] || 0;
+      const curG2 = sets2[sets2.length - 1] || 0;
+      if (!isNaN(curG1) && !isNaN(curG2) && curG1 !== curG2) { s1 = curG1; s2 = curG2; }
+    }
+  } else if (sportUp.includes('CRICKET')) {
+    // Cricket: score format "runs/wickets" (e.g., "129/9")
+    // Compare runs only — parseInt naturally extracts runs from "129/9"
+    s1 = parseInt((game.score1 || '0').replace(/\/.*/, ''), 10) || 0;
+    s2 = parseInt((game.score2 || '0').replace(/\/.*/, ''), 10) || 0;
+  } else {
+    // Basketball, Hockey, Soccer, Baseball, Handball, etc.: cumulative integer scores
+    s1 = parseInt(game.score1 || '0', 10) || 0;
+    s2 = parseInt(game.score2 || '0', 10) || 0;
+  }
+
+  // Tied or 0-0 — skip entirely
+  if (s1 === s2) return null;
+
+  const winnerIdx = s1 > s2 ? 0 : 1;
+  const winnerML = winnerIdx === 0 ? game.ml1 : game.ml2;
+  if (!winnerML || !winnerML.value) return null;
+
+  // No ML filtering — ALWAYS bet the score leader.
+  // + odds on a team that's currently winning = maximum value.
+
+  const winnerTeam = winnerIdx === 0 ? game.team1 : game.team2;
+  return {
+    team: winnerTeam,
+    odds: winnerML.value,
+    buttonIndex: winnerML.idx,
+    team1: game.team1,
+    team2: game.team2,
+    score: `${s1}-${s2}`,
+    rawScores: { t1: game.rawScores1 || [], t2: game.rawScores2 || [] },
+    period: game.period,
+    clock: game.clock,
+  };
+}
+
+// ─── Pick Best + Odds (closest to +100 across all 6 buttons) ─────────────────
+// Scans all buttons on a game, collects every + odds entry,
+// picks the one whose value is closest to +100 (i.e. lowest positive number).
+function pickOU(game, sport = '') {
+  const allOdds = game.allOdds || [];
+  const candidates = [];
+
+  for (let i = 0; i < allOdds.length; i++) {
+    const parts = allOdds[i].split('|');
+    const value  = parts[0] || '';
+    const points = parts[1] || '';
+    const title  = (parts[2] || '').toUpperCase();
+
+    const num = parseAmericanOdds(value);
+    if (isNaN(num) || num <= 0) continue; // only + odds
+
+    // Label the type for logging
+    const pUp = points.toUpperCase();
+    let type;
+    if (title === 'O' || title === 'OVER' || pUp.startsWith('O ') || pUp.startsWith('OVER ')) {
+      type = `OVER ${points}`;
+    } else if (title === 'U' || title === 'UNDER' || pUp.startsWith('U ') || pUp.startsWith('UNDER ')) {
+      type = `UNDER ${points}`;
+    } else if (points.startsWith('+') || points.startsWith('-')) {
+      type = `SPREAD ${points}`;
+    } else {
+      type = `ML ${title || points}`;
+    }
+
+    candidates.push({ num, value, points, title, type, buttonIndex: i });
+  }
+
+  if (candidates.length === 0) return null;
+
+  // Pick the + odds closest to +100 (smallest positive number)
+  candidates.sort((a, b) => a.num - b.num);
+  const best = candidates[0];
+
+  const s1 = parseInt(game.score1 || '0', 10) || 0;
+  const s2 = parseInt(game.score2 || '0', 10) || 0;
+
+  return {
+    team:        best.type,
+    label:       `${best.type} @ ${best.value}`,
+    odds:        best.value,
+    buttonIndex: best.buttonIndex,
+    team1:       game.team1,
+    team2:       game.team2,
+    score:       `${s1}-${s2}`,
+    points:      best.points,
+    period:      game.period,
+    clock:       game.clock,
+  };
+}
+
+// ─── Click Odds Button ───────────────────────────────────────────────────────
+async function clickMoneyline(page, pick) {
+  return page.evaluate((target, sel) => {
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+    const blocks = Array.from(document.querySelectorAll(sel.gameBlock))
+      .filter(b => b.querySelector(sel.gameBlockFilter));
+
+    const matchBlock = blocks.find(block => {
+      const teams = Array.from(block.querySelectorAll(sel.teamName)).map(el => norm(el.textContent));
+      return teams.includes(norm(target.team1)) && teams.includes(norm(target.team2));
+    });
+
+    if (!matchBlock) return null;
+    matchBlock.scrollIntoView({ block: 'center', behavior: 'instant' });
+
+    const buttons = Array.from(matchBlock.querySelectorAll(sel.oddsButton));
+
+    // Try button index first (fastest)
+    if (target.buttonIndex >= 0 && target.buttonIndex < buttons.length) {
+      buttons[target.buttonIndex].click();
+      return 'index';
+    }
+    // Fallback: match by O/U title
+    const side = (target.team || '').toUpperCase();
+    if (side === 'OVER' || side === 'UNDER') {
+      const titleChar = side === 'OVER' ? 'O' : 'U';
+      for (const btn of buttons) {
+        const titleEl = btn.querySelector(sel.oddsTitle);
+        const t = titleEl ? (titleEl.textContent || '').trim().toUpperCase() : '';
+        if (t === titleChar || t === side) { btn.click(); return 'title'; }
+      }
+    }
+    // Fallback: match odds text
+    for (const btn of buttons) {
+      const oddsEl = btn.querySelector(sel.oddsValue) || btn;
+      if (norm(oddsEl.textContent) === norm(target.odds)) { btn.click(); return 'text_match'; }
+    }
+    return null;
+  }, pick, SEL);
+}
+
+// ─── Bet Slip Operations ─────────────────────────────────────────────────────
+
+async function clearBetSlip(page) {
+  await page.evaluate(() => {
+    for (const el of document.querySelectorAll('button, [role="button"], a, span, div')) {
+      const text = (el.textContent || '').trim().toLowerCase();
+      if (text === 'clear all' || text === 'remove suspended picks' || text === 'remove suspended' || text === 'remove closed picks' || text === 'remove closed') {
+        el.click();
+      }
+    }
+  });
+  await new Promise(r => setTimeout(r, 800));
+  await page.evaluate(() => {
+    for (const el of document.querySelectorAll('button, [role="button"], a, span, div')) {
+      const text = (el.textContent || '').trim().toLowerCase();
+      if (text === 'clear all' || text === '×' || text === 'yes' || text === 'confirm' || text === 'ok') { el.click(); return; }
+    }
+  });
+  await new Promise(r => setTimeout(r, 500));
+}
+
+// Close "Bet Placed" receipt overlay so it doesn't block next cycle
+async function closeBetReceipt(page) {
+  for (let i = 0; i < 3; i++) {
+    const closed = await page.evaluate(() => {
+      // Look for Close/Done/X button on the receipt
+      for (const el of document.querySelectorAll('button, [role="button"], a, span, div')) {
+        const text = (el.textContent || '').trim().toLowerCase();
+        if (text.length > 30) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0 || rect.x < 500) continue;
+        if (text === 'close' || text === 'done' || text === '×' || text === 'x' ||
+            text === 'ok' || text === 'got it' || text === 'continue') {
+          el.click();
+          return text;
+        }
+      }
+      return null;
+    }).catch(() => null);
+    if (closed) {
+      log(`  Closed bet receipt ("${closed}")`);
+      await new Promise(r => setTimeout(r, 200));
+      return true;
+    }
+    await new Promise(r => setTimeout(r, 300));
+  }
+  // Fallback: just clear the slip
+  await clearBetSlip(page);
+  return false;
+}
+
+async function switchToParlayTab(page) {
+  // Try multiple approaches to find and click the Parlay tab in the bet slip
+  const clicked = await page.evaluate(() => {
+    for (const el of document.querySelectorAll('a, button, [role="tab"], div, span, li')) {
+      const text = (el.textContent || '').trim().toUpperCase();
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+      if (text === 'PARLAY' || text === 'PARLAYS') {
+        el.scrollIntoView({ block: 'center' });
+        el.click();
+        return 'found';
+      }
+    }
+    return null;
+  });
+  if (clicked) return true;
+
+  // Method 2: scroll bet slip and look again
+  await page.evaluate(() => {
+    const betslip = document.querySelector('[class*="betslip"], [class*="bet-slip"], [class*="picks"]');
+    if (betslip) betslip.scrollTop = betslip.scrollHeight;
+  });
+  await new Promise(r => setTimeout(r, 500));
+  return page.evaluate(() => {
+    for (const el of document.querySelectorAll('a, button, [role="tab"], div, span, li')) {
+      const text = (el.textContent || '').trim().toUpperCase();
+      if (text === 'PARLAY' || text === 'PARLAYS') {
+        el.click();
+        return true;
+      }
+    }
+    return false;
+  });
+}
+
+async function enterWager(page, amount) {
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    // Scroll bet slip to bottom to reveal parlay section
+    await page.evaluate(() => {
+      for (const el of document.querySelectorAll('[class*="betslip"], [class*="bet-slip"], [class*="slip"], [class*="BetSlip"], [class*="Slip"]')) {
+        if (el.scrollHeight > el.clientHeight) el.scrollTop = el.scrollHeight;
+      }
+    }).catch(() => {});
+    await new Promise(r => setTimeout(r, 300));
+
+    // ONLY find the parlay input — match "X Pick Parlay" text, never fall back to singles
+    const parlayInput = await page.evaluate(() => {
+      // Find "X Pick Parlay" text element
+      for (const el of document.querySelectorAll('div, span, p, li, a, h1, h2, h3, h4, h5, h6')) {
+        const text = (el.textContent || '').trim();
+        if (!/\d+\s*[-–]?\s*pick\s*parlay/i.test(text)) continue;
+        if (text.length > 120) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        const parlayY = rect.y + rect.height / 2;
+
+        // Find the input nearest to this parlay text
+        let best = null, bestDist = 999;
+        for (const input of document.querySelectorAll('input')) {
+          const ir = input.getBoundingClientRect();
+          if (ir.width === 0 || ir.height === 0 || ir.width > 250) continue;
+          const dist = Math.abs(ir.y + ir.height / 2 - parlayY);
+          if (dist < bestDist) { bestDist = dist; best = { x: ir.x + ir.width / 2, y: ir.y + ir.height / 2, dist }; }
+        }
+        if (best && best.dist < 120) {
+          return { found: true, x: best.x, y: best.y, text: text.slice(0, 50) };
+        }
+      }
+      return { found: false };
+    }).catch(() => ({ found: false }));
+
+    if (!parlayInput.found) {
+      log(`  No parlay input found (attempt ${attempt}/3)`);
+      await new Promise(r => setTimeout(r, 500));
+      continue;
+    }
+
+    log(`  Parlay input: "${parlayInput.text}" at (${Math.round(parlayInput.x)},${Math.round(parlayInput.y)})`);
+
+    // Click, clear, type amount — fast
+    await page.mouse.click(parlayInput.x, parlayInput.y, { clickCount: 3 });
+    await new Promise(r => setTimeout(r, 50));
+    await page.keyboard.press('Backspace');
+    await page.keyboard.type(amount.toString(), { delay: 30 });
+
+    // Also force via React setter
+    await page.evaluate(({ x, y, amt }) => {
+      const el = document.elementFromPoint(x, y);
+      if (!el || el.tagName !== 'INPUT') return;
+      try {
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        setter.call(el, amt);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      } catch {}
+    }, { x: parlayInput.x, y: parlayInput.y, amt: amount.toString() });
+    await page.keyboard.press('Tab');
+    await new Promise(r => setTimeout(r, 200));
+
+    log(`  ✅ Parlay wager set: $${amount}`);
+    return true;
+  }
+  log('❌ Could not find parlay wager input');
+  return false;
+}
+
+// ─── Balance & Open Positions ────────────────────────────────────────────────
+async function getBalance(page) {
+  return page.evaluate(() => {
+    const body = document.body?.innerText || '';
+    const m = body.match(/balance[^$]*\$([\d,]+\.?\d*)/i);
+    if (m) return parseFloat(m[1].replace(/,/g, ''));
+    return null;
+  }).catch(() => null);
+}
+
+async function countOpenPositions(page) {
+  try {
+    // Navigate to My Bets page
+    await page.goto('https://sportsbook.draftkings.com/mybets', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await new Promise(r => setTimeout(r, 3000));
+
+    // Click "Open" tab if present
+    await page.evaluate(() => {
+      for (const el of document.querySelectorAll('a, button, [role="tab"], span, div')) {
+        const t = (el.textContent || '').trim().toLowerCase();
+        if (t === 'open' || t === 'unsettled') {
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    });
+    await new Promise(r => setTimeout(r, 2000));
+
+    // Count open bet cards/entries
+    const result = await page.evaluate(() => {
+      const body = document.body?.innerText || '';
+      let count = 0;
+      // Strategy 1: Look for bet card containers with wager/payout info
+      for (const el of document.querySelectorAll('[class*="bet-card"], [class*="betCard"], [class*="BetCard"], [class*="bet-slip-card"], [class*="mybet"]')) {
+        const rect = el.getBoundingClientRect();
+        if (rect.height > 30 && rect.width > 100) count++;
+      }
+      // Strategy 2: If no cards found, count by text patterns (Parlay, Single, etc.)
+      if (count === 0) {
+        const parlayMatches = body.match(/\d+[- ]?leg parlay/gi);
+        const singleMatches = body.match(/single/gi);
+        count = (parlayMatches?.length || 0) + (singleMatches?.length || 0);
+      }
+      // Strategy 3: Count any visible $ wager amounts in the bets area
+      if (count === 0) {
+        const wagers = body.match(/\$\d+\.\d{2}/g);
+        count = Math.floor((wagers?.length || 0) / 2);
+      }
+      return count;
+    });
+
+    return result;
+  } catch (e) {
+    log(`  Open positions check error: ${e.message.split('\n')[0]}`);
+    return -1;
+  }
+}
+
+async function acceptOddsChanges(page) {
+  // DOM click — bet slip panel scrolls independently, mouse coords often off-screen
+  const result = await page.evaluate(() => {
+    const keywords = ['accept', 'accept changes', 'accept odds changes',
+      'accept all changes', 'accept & place bet', 'accept & place'];
+    for (const el of document.querySelectorAll('button, [role="button"]')) {
+      const text = (el.textContent || '').trim().toLowerCase();
+      if (text.length > 60) continue;
+      if (keywords.includes(text) || text.includes('accept change') || text.includes('accept odds')) {
+        el.click();
+        return text;
+      }
+    }
+    return null;
+  }).catch(() => null);
+  if (result) {
+    log(`  ✅ Accepted odds changes: "${result}"`);
+    return 1;
+  }
+  return 0;
+}
+
+async function clickPlaceBet(page) {
+  // Step 1: Expand collapsed bet slip drawer if present
+  await page.evaluate(() => {
+    for (const el of document.querySelectorAll('div, button, [role="button"], a, span')) {
+      const text = (el.textContent || '').trim().toLowerCase();
+      const rect = el.getBoundingClientRect();
+      if ((text.includes('bet slip') || text.includes('betslip')) && rect.y > 500 && rect.height < 80 && rect.width > 200) {
+        el.click();
+        return true;
+      }
+    }
+    return false;
+  }).catch(() => false);
+  await new Promise(r => setTimeout(r, 1000));
+
+  // Step 2: Remove suspended/closed picks (loop until none remain)
+  for (let i = 0; i < 5; i++) {
+    const removed = await page.evaluate(() => {
+      for (const el of document.querySelectorAll('button, [role="button"], a')) {
+        const t = (el.textContent || '').trim().toLowerCase();
+        if (t.length < 80 && (t.includes('remove suspended') || t.includes('remove closed'))) {
+          el.click(); return true;
+        }
+      }
+      return false;
+    }).catch(() => false);
+    if (!removed) break;
+    log(`Removed suspended pick (pass ${i + 1})`);
+    await new Promise(r => setTimeout(r, 500));
+  }
+
+  // Step 3: Accept odds changes
+  for (let i = 0; i < 3; i++) {
+    if ((await acceptOddsChanges(page)) === 0) break;
+    await new Promise(r => setTimeout(r, 800));
+  }
+
+  // Step 4: Switch to Parlay tab and enter wager
+  await switchToParlayTab(page);
+  await enterWager(page, PARLAY_WAGER);
+  await new Promise(r => setTimeout(r, 1500));
+
+  // Step 5: Accept odds changes AGAIN (DK shows new warnings after calculateBets)
+  for (let i = 0; i < 3; i++) {
+    if ((await acceptOddsChanges(page)) === 0) break;
+    await new Promise(r => setTimeout(r, 800));
+  }
+
+  // Step 6: Remove any newly suspended picks
+  for (let i = 0; i < 3; i++) {
+    const removed = await page.evaluate(() => {
+      for (const el of document.querySelectorAll('button, [role="button"], a')) {
+        const t = (el.textContent || '').trim().toLowerCase();
+        if (t.length < 80 && (t.includes('remove suspended') || t.includes('remove closed'))) {
+          el.click(); return true;
+        }
+      }
+      return false;
+    }).catch(() => false);
+    if (!removed) break;
+    log(`Removed late suspended pick (pass ${i + 1})`);
+    await new Promise(r => setTimeout(r, 500));
+  }
+
+  // Step 7: Final accept odds changes pass
+  for (let i = 0; i < 3; i++) {
+    if ((await acceptOddsChanges(page)) === 0) break;
+    await new Promise(r => setTimeout(r, 800));
+  }
+  await new Promise(r => setTimeout(r, 500));
+
+  // Step 8: Find and click Place Bet / Accept Change & Place Bet button
+  const clicked = await page.evaluate(() => {
+    let best = null; let bestScore = 0;
+    const allButtons = [];
+    for (const el of document.querySelectorAll('button, [role="button"], a, div, span')) {
+      const text = (el.textContent || '').trim().toLowerCase();
+      if (text.length > 100) continue;
+      if (!text.includes('place bet') && !text.includes('place wager') &&
+          !text.includes('accept & place') && !text.includes('accept change') &&
+          !text.includes('place')) continue;
+      let score = 1;
+      if (el.tagName === 'BUTTON') score += 10;
+      if (el.getAttribute('role') === 'button') score += 5;
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 100) score += 5;
+      if (rect.height > 30) score += 3;
+      if (rect.x >= 700) score += 3;
+      const directText = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent).join('').trim().toLowerCase();
+      if (directText.includes('place bet') || directText.includes('accept change')) score += 8;
+      allButtons.push({ text: text.slice(0, 60), score, x: Math.round(rect.x), y: Math.round(rect.y), tag: el.tagName });
+      if (score > bestScore) { bestScore = score; best = el; }
+    }
+    if (!best) return { found: false, allButtons };
+    best.scrollIntoView({ block: 'center', behavior: 'instant' });
+    best.click();
+    const rect = best.getBoundingClientRect();
+    return { found: true, tag: best.tagName, score: bestScore, text: (best.textContent || '').trim().toLowerCase().slice(0, 60), x: Math.round(rect.x), y: Math.round(rect.y), allButtons };
+  }).catch(() => ({ found: false, allButtons: [] }));
+
+  if (!clicked.found) {
+    logBet(`Place Bet button not found. Found ${clicked.allButtons.length} candidate buttons: ${JSON.stringify(clicked.allButtons.slice(0, 5))}`);
+    // Try alternative: look for any button with "place" in text in the bet slip area
+    const altClicked = await page.evaluate(() => {
+      for (const el of document.querySelectorAll('button, [role="button"]')) {
+        const text = (el.textContent || '').trim().toLowerCase();
+        const rect = el.getBoundingClientRect();
+        if (text.includes('place') && rect.width > 50 && rect.height > 20 && rect.x > 600) {
+          el.scrollIntoView({ block: 'center', behavior: 'instant' });
+          el.click();
+          return { text: text.slice(0, 50), x: Math.round(rect.x), y: Math.round(rect.y) };
+        }
+      }
+      return null;
+    }).catch(() => null);
+    if (altClicked) {
+      logBet(`Alternative Place Bet clicked: "${altClicked.text}"`);
+      return true;
+    }
+    return false;
+  }
+
+  logBet(`Place Bet clicked: "${clicked.text}" [${clicked.tag}] at (${clicked.x},${clicked.y})`);
+  await new Promise(r => setTimeout(r, 500));
+  // Second click for reliability
+  await page.evaluate(() => {
+    for (const el of document.querySelectorAll('button, [role="button"]')) {
+      const text = (el.textContent || '').trim().toLowerCase();
+      if (text.length < 100 && (text.includes('place bet') || text.includes('place wager') ||
+          text.includes('accept & place') || text.includes('accept change'))) {
+        el.click();
+        return true;
+      }
+    }
+    return false;
+  }).catch(() => false);
+  return true;
+}
+
+// ─── Click Sport Tab ─────────────────────────────────────────────────────────
+// Click a sport tab on the DK live page (no full page navigation)
+async function clickSportTab(page, sportName) {
+  // Map our sport names to DK tab text
+  const tabNames = {
+    BASKETBALL: ['BASKETBALL'],
+    HOCKEY: ['HOCKEY', 'NHL'],
+    TENNIS: ['TENNIS'],
+    TABLE_TENNIS: ['TABLE TENNIS'],
+    SOCCER: ['SOCCER', 'FOOTBALL'],
+    BASEBALL: ['BASEBALL'],
+    HANDBALL: ['HANDBALL'],
+    VOLLEYBALL: ['VOLLEYBALL'],
+    CRICKET: ['CRICKET'],
+    BADMINTON: ['BADMINTON'],
+  };
+  const targets = tabNames[sportName] || [sportName];
+
+  const clicked = await page.evaluate((targets) => {
+    // Look for sport tabs near the top of the page (y < 150)
+    for (const el of document.querySelectorAll('a, button, [role="tab"], span, div')) {
+      const text = (el.textContent || '').trim().toUpperCase();
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+      // Tab area: near the top, reasonable size
+      if (rect.y > 200 || rect.height > 60 || rect.width > 250 || rect.width < 30) continue;
+      if (targets.includes(text)) {
+        el.scrollIntoView({ block: 'center' });
+        el.click();
+        return text;
+      }
+    }
+    return null;
+  }, targets);
+
+  if (clicked) {
+    await new Promise(r => setTimeout(r, 2000)); // Wait for content to load
+    // Expand collapsed sections
+    await page.evaluate((sel) => {
+      document.querySelectorAll(sel).forEach(btn => btn.click());
+    }, SEL.collapsed);
+    await new Promise(r => setTimeout(r, 800));
+  }
+  return clicked;
+}
+
+async function getVisibleSportTabs(page) {
+  return page.evaluate(() => {
+    const known = new Set(['SOCCER', 'TENNIS', 'TABLE TENNIS', 'BASKETBALL', 'BASEBALL', 'HOCKEY', 'NHL', 'CRICKET', 'HANDBALL', 'VOLLEYBALL', 'BADMINTON']);
+    const tabs = [];
+    for (const el of document.querySelectorAll('a, button, [role="tab"], span, div')) {
+      const text = (el.textContent || '').trim().toUpperCase();
+      const rect = el.getBoundingClientRect();
+      if (!known.has(text)) continue;
+      if (rect.width === 0 || rect.height === 0) continue;
+      if (rect.y > 200 || rect.height > 60 || rect.width > 250 || rect.width < 30) continue;
+      tabs.push({ text, x: rect.x, y: rect.y, width: rect.width, height: rect.height });
+    }
+    // Sort left→right, dedup by normalized name (NHL=HOCKEY)
+    const norm = t => t === 'NHL' ? 'HOCKEY' : t;
+    const seen = new Set();
+    const deduped = [];
+    for (const tab of tabs.sort((a, b) => a.x - b.x)) {
+      const key = norm(tab.text);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(tab);
+    }
+    return deduped;
+  });
+}
+
+async function clickVisibleSportTab(page, tabText, tabRect) {
+  // Always scroll to top first so tab bar is visible
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await new Promise(r => setTimeout(r, 300));
+
+  // Method 1: DOM click — prefer <a> tags (DK sport tabs are links), then buttons
+  const domClicked = await page.evaluate((tabText) => {
+    const tagPriority = { A: 0, BUTTON: 1 };
+    let best = null;
+    let bestPrio = 999;
+    let bestSize = 0;
+    for (const el of document.querySelectorAll('a, button, [role="tab"], span, div')) {
+      const text = (el.textContent || '').trim().toUpperCase();
+      if (text !== tabText) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+      if (rect.y > 200 || rect.height > 60 || rect.width > 250 || rect.width < 30) continue;
+      const prio = tagPriority[el.tagName] ?? (el.getAttribute('role') === 'tab' ? 2 : 10);
+      const size = rect.width * rect.height;
+      if (prio < bestPrio || (prio === bestPrio && size > bestSize)) {
+        best = el;
+        bestPrio = prio;
+        bestSize = size;
+      }
+    }
+    if (!best) return null;
+    best.click();
+    return best.tagName + ':' + best.getBoundingClientRect().x.toFixed(0);
+  }, tabText);
+
+  if (!domClicked) {
+    // Method 2: Coordinate click as fallback
+    if (tabRect && tabRect.x && tabRect.y) {
+      const cx = tabRect.x + tabRect.width / 2;
+      const cy = tabRect.y + tabRect.height / 2;
+      await page.mouse.click(cx, cy);
+    } else {
+      return false;
+    }
+  }
+
+  await new Promise(r => setTimeout(r, 800));
+  return true;
+}
+
+async function expandAllSections(page) {
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  await new Promise(r => setTimeout(r, 200));
+
+  for (let pass = 0; pass < 10; pass++) {
+    const expandedCount = await page.evaluate((sel) => {
+      const collapsed = document.querySelectorAll(sel);
+      let count = 0;
+      collapsed.forEach(btn => { btn.click(); count++; });
+      return count;
+    }, SEL.collapsed).catch(() => 0);
+
+    if (expandedCount > 0) {
+      log(`    Expanded ${expandedCount} section(s) (pass ${pass + 1})`);
+      await new Promise(r => setTimeout(r, 200));
+    }
+
+    const atBottom = await page.evaluate(() => {
+      if (!document.body) return true;
+      window.scrollBy(0, window.innerHeight * 0.8);
+      return window.scrollY + window.innerHeight >= document.body.scrollHeight - 50;
+    }).catch(() => true);
+    await new Promise(r => setTimeout(r, 200));
+
+    if (atBottom && expandedCount === 0) break;
+  }
+
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  await new Promise(r => setTimeout(r, 150));
+  await page.evaluate((sel) => {
+    document.querySelectorAll(sel).forEach(btn => btn.click());
+  }, SEL.collapsed).catch(() => {});
+  await new Promise(r => setTimeout(r, 200));
+}
+
+// ─── Multi-Strategy Pick Functions ──────────────────────────────────────────
+
+// Parse O/U picks from a game's allOdds — "discount" = odds >= -105 (better than standard -110)
+function pickOverUnderValue(game) {
+  const picks = [];
+  const allOdds = game.allOdds || [];
+  for (let i = 0; i < allOdds.length; i++) {
+    const parts = allOdds[i].split('|');
+    const value = parts[0] || '';
+    const points = parts[1] || '';
+    const title = (parts[2] || '').toUpperCase();
+    const isOU = title === 'O' || title === 'U' ||
+                 points.toUpperCase().startsWith('O ') || points.toUpperCase().startsWith('U ');
+    if (!isOU) continue;
+    const oddsNum = parseAmericanOdds(value);
+    if (isNaN(oddsNum)) continue;
+    if (oddsNum < -105) continue; // only "discounted" lines
+    const side = (title === 'O' || points.toUpperCase().startsWith('O')) ? 'OVER' : 'UNDER';
+    picks.push({
+      team: side, label: `${side} ${points} @ ${value}`,
+      odds: value, buttonIndex: i,
+      team1: game.team1, team2: game.team2,
+      points, score: `${game.score1}-${game.score2}`,
+      period: game.period, clock: game.clock,
+    });
+  }
+  return picks;
+}
+
+// Pick positive spread bets — only + spreads (underdog getting points)
+function pickPositiveSpread(game) {
+  const picks = [];
+  const allOdds = game.allOdds || [];
+  for (let i = 0; i < allOdds.length; i++) {
+    const parts = allOdds[i].split('|');
+    const value = parts[0] || '';
+    const points = parts[1] || '';
+    const title = (parts[2] || '').toUpperCase();
+    if (title === 'O' || title === 'U' ||
+        points.toUpperCase().startsWith('O ') || points.toUpperCase().startsWith('U ')) continue;
+    if (!points || !points.startsWith('+')) continue;
+    const spreadVal = parseFloat(points.replace('+', ''));
+    if (isNaN(spreadVal) || spreadVal <= 0) continue;
+    picks.push({
+      team: `+${spreadVal}`, label: `${points} @ ${value}`,
+      odds: value, buttonIndex: i,
+      team1: game.team1, team2: game.team2,
+      points, spread: spreadVal,
+      score: `${game.score1}-${game.score2}`,
+      period: game.period, clock: game.clock,
+    });
+  }
+  return picks;
+}
+
+// Generic: collect picks across all visible sport tabs
+// pickFn(game, sport) → array of pick objects for that game
+async function collectAllPicks(page, visibleTabs, pickFn) {
+  const allPicks = [];
+  const addedGames = new Set();
+  const SKIP = new Set(['SOCCER']);
+  for (const tab of visibleTabs) {
+    if (SKIP.has(tab.text.toUpperCase())) continue;
+    const tabClicked = await clickVisibleSportTab(page, tab.text, tab);
+    if (!tabClicked) continue;
+    await expandAllSections(page);
+    const games = await scrapeGames(page);
+    for (const game of games) {
+      const key = [game.team1, game.team2].sort().join('|').toLowerCase();
+      if (addedGames.has(key)) continue;
+      addedGames.add(key);
+      const picks = pickFn(game, tab.text);
+      for (const p of picks) { p.sport = tab.text; p.sportTab = tab; }
+      allPicks.push(...picks);
+    }
+  }
+  return allPicks;
+}
+
+// Like clickMoneyline but lenient — clicks by button index without requiring odds text match
+// Handles live odds shifts between collection and placement
+async function clickOddsButton(page, pick) {
+  return page.evaluate((target, sel) => {
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+    const blocks = Array.from(document.querySelectorAll(sel.gameBlock))
+      .filter(b => b.querySelector(sel.gameBlockFilter));
+    const matchBlock = blocks.find(block => {
+      const teams = Array.from(block.querySelectorAll(sel.teamName)).map(el => norm(el.textContent));
+      return teams.includes(norm(target.team1)) && teams.includes(norm(target.team2));
+    });
+    if (!matchBlock) return null;
+    matchBlock.scrollIntoView({ block: 'center', behavior: 'instant' });
+    const buttons = Array.from(matchBlock.querySelectorAll(sel.oddsButton));
+    // Click by stored index (same market position even if odds shifted)
+    if (target.buttonIndex >= 0 && target.buttonIndex < buttons.length) {
+      const btn = buttons[target.buttonIndex];
+      btn.click();
+      const oddsEl = btn.querySelector(sel.oddsValue) || btn;
+      return 'idx:' + norm(oddsEl.textContent);
+    }
+    // Fallback: try text match
+    for (const btn of buttons) {
+      const oddsEl = btn.querySelector(sel.oddsValue) || btn;
+      if (norm(oddsEl.textContent) === norm(target.odds)) { btn.click(); return 'text_match'; }
+    }
+    return null;
+  }, pick, SEL);
+}
+
+// Scroll through virtualized list until a game block with both team names is in the DOM
+async function scrollToGame(page, team1, team2) {
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  await new Promise(r => setTimeout(r, 200));
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+  for (let pass = 0; pass < 30; pass++) {
+    const found = await page.evaluate((t1, t2, sel) => {
+      const n = s => (s || '').replace(/\s+/g, ' ').trim();
+      for (const block of document.querySelectorAll(sel.gameBlock)) {
+        const teams = Array.from(block.querySelectorAll(sel.teamName)).map(el => n(el.textContent));
+        if (teams.includes(n(t1)) && teams.includes(n(t2))) {
+          block.scrollIntoView({ block: 'center', behavior: 'instant' });
+          return true;
+        }
+      }
+      return false;
+    }, team1, team2, SEL).catch(() => false);
+    if (found) return true;
+    const atBottom = await page.evaluate(() => {
+      if (!document.body) return true;
+      window.scrollBy(0, window.innerHeight * 0.8);
+      return window.scrollY + window.innerHeight >= document.body.scrollHeight - 50;
+    }).catch(() => true);
+    await new Promise(r => setTimeout(r, 250));
+    if (atBottom) break;
+  }
+  return false;
+}
+
+// Place a single parlay from an array of pre-collected picks
+async function placeParlayFromPicks(page, picks, wager, label) {
+  await clearBetSlip(page);
+  await new Promise(r => setTimeout(r, 500));
+
+  // Group by sport so we navigate tabs efficiently
+  const bySport = {};
+  for (const p of picks) {
+    const s = p.sport || 'UNKNOWN';
+    if (!bySport[s]) bySport[s] = [];
+    bySport[s].push(p);
+  }
+
+  let addedCount = 0;
+  for (const [sport, sportPicks] of Object.entries(bySport)) {
+    const tab = sportPicks[0].sportTab;
+    if (tab) await clickVisibleSportTab(page, tab.text, tab);
+    await expandAllSections(page);
+    for (const pick of sportPicks) {
+      // Scroll virtualized list to bring this game into the DOM
+      const scrolled = await scrollToGame(page, pick.team1, pick.team2);
+      if (!scrolled) {
+        log(`    ❌ Could not find game block: ${pick.team1} vs ${pick.team2} (not in DOM after scrolling)`);
+        continue;
+      }
+      await new Promise(r => setTimeout(r, 300));
+      
+      // Retry logic with exponential backoff
+      let clicked = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        clicked = await clickOddsButton(page, pick);
+        if (clicked) break;
+        if (attempt < 2) {
+          const delay = 500 * Math.pow(2, attempt); // 500ms, 1000ms, 2000ms
+          log(`    ⏳ Retry ${attempt + 1}/3 for ${pick.team1} vs ${pick.team2} (waiting ${delay}ms)`);
+          await new Promise(r => setTimeout(r, delay));
+        }
+      }
+      
+      if (clicked) {
+        addedCount++;
+        log(`    Added: ${pick.team1} vs ${pick.team2} → ${pick.label || pick.team} @ ${pick.odds} (${clicked})`);
+        await new Promise(r => setTimeout(r, 1500)); // Increased from 800ms to 1500ms
+      } else {
+        log(`    ❌ Could not click for ${pick.team1} vs ${pick.team2} after 3 attempts`);
+      }
+    }
+  }
+
+  if (addedCount < 2) {
+    log(`  Only ${addedCount} leg(s) — need ≥2, skipping`);
+    await clearBetSlip(page);
+    return false;
+  }
+
+  // Scroll page to top so bet slip panel is fully visible
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  await new Promise(r => setTimeout(r, 1500));
+
+  // Verify actual bet slip leg count (the green circle number on "BET SLIP")
+  const actualLegs = await page.evaluate(() => {
+    // DK shows leg count in a badge/circle near "BET SLIP" text
+    for (const el of document.querySelectorAll('span, div, [class*="badge"], [class*="count"], [class*="indicator"]')) {
+      const t = (el.textContent || '').trim();
+      const rect = el.getBoundingClientRect();
+      if (/^\d+$/.test(t) && rect.width > 0 && rect.width < 50 && rect.height < 50 && rect.x > 700) {
+        const n = parseInt(t, 10);
+        if (n >= 1 && n <= 30) return n;
+      }
+    }
+    return -1;
+  }).catch(() => -1);
+  log(`  Bet slip shows ${actualLegs} leg(s) (expected ${addedCount})`);
+
+  // If leg count doesn't match, wait and retry verification (DraftKings may be slow to update)
+  if (actualLegs >= 0 && actualLegs !== addedCount) {
+    log(`  ⏳ Leg count mismatch, waiting for DraftKings to update...`);
+    await new Promise(r => setTimeout(r, 3000));
+    const retryLegs = await page.evaluate(() => {
+      for (const el of document.querySelectorAll('span, div, [class*="badge"], [class*="count"], [class*="indicator"]')) {
+        const t = (el.textContent || '').trim();
+        const rect = el.getBoundingClientRect();
+        if (/^\d+$/.test(t) && rect.width > 0 && rect.width < 50 && rect.height < 50 && rect.x > 700) {
+          const n = parseInt(t, 10);
+          if (n >= 1 && n <= 30) return n;
+        }
+      }
+      return -1;
+    }).catch(() => -1);
+    log(`  Retry verification: ${retryLegs} leg(s)`);
+    if (retryLegs >= 0) actualLegs = retryLegs;
+  }
+
+  if (actualLegs >= 0 && actualLegs < 2) {
+    log(`  ⚠️ Bet slip has <2 actual legs — skipping placement`);
+    await clearBetSlip(page);
+    return false;
+  }
+
+  // Wait for DraftKings to update bet slip with parlay section
+  log(`  ⏳ Waiting for parlay section to load...`);
+  await new Promise(r => setTimeout(r, 5000));
+
+  // Debug: Check what's in the bet slip
+  const betSlipContent = await page.evaluate(() => {
+    const slip = document.querySelector('[class*="betslip"], [class*="bet-slip"], [class*="slip"], [class*="BetSlip"], [class*="Slip"]');
+    if (!slip) return 'No bet slip found';
+    return slip.textContent.slice(0, 500);
+  }).catch(() => 'Error reading bet slip');
+  log(`  Bet slip content preview: "${betSlipContent.slice(0, 200)}"`);
+
+  // Enter wager amount before placing bet
+  const wagerSet = await enterWager(page, wager);
+  if (!wagerSet) {
+    log(`  ⚠️ Could not set wager amount`);
+    await clearBetSlip(page);
+    return false;
+  }
+
+  const placed = await clickPlaceBet(page);
+  if (placed) {
+    logBet(`🎯 ${label}: ${addedCount}-leg parlay placed @ $${wager}`);
+    const entry = {
+      ts: new Date().toISOString(), type: label, legs: addedCount, wager,
+      picks: picks.map(p => `${p.team1} vs ${p.team2}: ${p.label || p.team} ${p.odds}`),
+    };
+    try { appendFileSync(PARLAY_LOG, JSON.stringify(entry) + '\n'); } catch {}
+    await new Promise(r => setTimeout(r, 2000));
+    await closeBetReceipt(page);
+  } else {
+    log(`  ⚠️ Could not place ${label} parlay`);
+    await screenshot(page, `${label.toLowerCase().replace(/\s+/g, '-')}-failed`);
+  }
+  await clearBetSlip(page);
+  return !!placed;
+}
+
+// ─── Structured Parlays: 2, 3, 5, 8 leg ML parlays ─────────────────────────
+async function runStructuredParlays(page, visibleTabs) {
+  log('\n═══ Structured Parlays Scan ═══════════════════════');
+
+  const mlPickFn = (game, sport) => {
+    const w = pickWinner(game, sport);
+    if (!w) return [];
+    w.label = `ML ${w.team}`;
+    return [w];
+  };
+
+  const allPicks = await collectAllPicks(page, visibleTabs, mlPickFn);
+  log(`Collected ${allPicks.length} ML picks for structured parlays`);
+  if (allPicks.length < 2) { log('Not enough picks'); return; }
+
+  for (const legCount of STRUCTURED_LEG_COUNTS) {
+    if (allPicks.length < legCount) {
+      log(`Not enough picks (${allPicks.length}) for ${legCount}-leg — skipping`);
+      continue;
+    }
+    const groups = [];
+    for (let i = 0; i + legCount <= allPicks.length; i += legCount) {
+      groups.push(allPicks.slice(i, i + legCount));
+    }
+    log(`\n─── ${legCount}-Leg Structured: ${groups.length} parlay(s) ───`);
+
+    for (let g = 0; g < groups.length; g++) {
+      log(`  Parlay ${g + 1}/${groups.length}: ${groups[g].map(p => p.team).join(' + ')}`);
+      try {
+        await page.goto('https://sportsbook.draftkings.com/live?category=live-in-game&subcategory=basketball',
+          { waitUntil: 'domcontentloaded', timeout: 30000 });
+      } catch {}
+      await new Promise(r => setTimeout(r, 3000));
+      await placeParlayFromPicks(page, groups[g], PARLAY_WAGER, `STRUCTURED-${legCount}L`);
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+  log('═══ Structured Parlays Complete ═══════════════════');
+}
+
+// ─── O/U Value Scan: max-leg parlay on discounted O/U ────────────────────────
+async function runOUValueScan(page, visibleTabs) {
+  log('\n═══ O/U Value Scan ═══════════════════════════════');
+  const allPicks = await collectAllPicks(page, visibleTabs, (game) => pickOverUnderValue(game));
+  log(`Collected ${allPicks.length} discounted O/U picks`);
+  if (allPicks.length < 2) { log('Not enough O/U value picks'); return; }
+
+  const picks = allPicks.slice(0, MAX_LEGS);
+  try {
+    await page.goto('https://sportsbook.draftkings.com/live?category=live-in-game&subcategory=basketball',
+      { waitUntil: 'domcontentloaded', timeout: 30000 });
+  } catch {}
+  await new Promise(r => setTimeout(r, 3000));
+  await placeParlayFromPicks(page, picks, PARLAY_WAGER, 'OU-VALUE');
+  log('═══ O/U Value Scan Complete ══════════════════════');
+}
+
+// ─── Spread Value Scan: max-leg parlay on + spreads ──────────────────────────
+async function runSpreadValueScan(page, visibleTabs) {
+  log('\n═══ Spread Value Scan ════════════════════════════');
+  const allPicks = await collectAllPicks(page, visibleTabs, (game) => pickPositiveSpread(game));
+  log(`Collected ${allPicks.length} positive spread picks`);
+  if (allPicks.length < 2) { log('Not enough + spread picks'); return; }
+
+  const picks = allPicks.slice(0, MAX_LEGS);
+  try {
+    await page.goto('https://sportsbook.draftkings.com/live?category=live-in-game&subcategory=basketball',
+      { waitUntil: 'domcontentloaded', timeout: 30000 });
+  } catch {}
+  await new Promise(r => setTimeout(r, 3000));
+  await placeParlayFromPicks(page, picks, PARLAY_WAGER, 'SPREAD-VALUE');
+  log('═══ Spread Value Scan Complete ═══════════════════');
+}
+
+// ─── Main Loop ───────────────────────────────────────────────────────────────
+async function main() {
+  log('═══════════════════════════════════════════════');
+  log('DraftKings Live O/U Parlay Bot');
+  log('═══════════════════════════════════════════════');
+  log(`Mode: O/U ONLY | Wager: $${PARLAY_WAGER} | Max legs: ${MAX_LEGS} | Interval: ${SCAN_INTERVAL / 1000}s`);
+  log(`Sports: ${SPORTS.map(s => s.name).join(', ')}`);
+  log('');
+
+  const { browser, page } = await connectBrowser();
+  log(`Page: ${page.url()}`);
+
+  // Track GeoComply CORS blocks at runtime
+  let corsBlocked = false;
+  page.on('requestfailed', req => {
+    const url = req.url();
+    const reason = req.failure()?.errorText || '';
+    if (url.includes('plc-gc.com') || url.includes('geocomply')) {
+      log(`🚨 GeoComply CORS block detected: ${url} — ${reason}`);
+      corsBlocked = true;
+    }
+  });
+
+  let cycle = 0;
+  let lastStructuredRun = 0; // epoch ms — runs immediately on first cycle then every 30 min
+  while (true) {
+    cycle++;
+    log(`\n─── Cycle ${cycle} ───────────────────────────────────`);
+    corsBlocked = false; // reset each cycle
+
+    try {
+      // Step 0: Ensure we are on the LIVE page (SPA may drift after bet placement)
+      const currentUrl = page.url();
+      if (!currentUrl.includes('/live') || !currentUrl.includes('live-in-game')) {
+        log(`⚠️ Not on live page (${currentUrl.slice(0, 80)}) — navigating back...`);
+        try {
+          await page.goto('https://sportsbook.draftkings.com/live?category=live-in-game&subcategory=basketball', { waitUntil: 'domcontentloaded', timeout: 30000 });
+        } catch (navErr) {
+          log(`Nav error: ${navErr.message.split('\n')[0]} — waiting...`);
+        }
+        await new Promise(r => setTimeout(r, 5000));
+      }
+
+      // Step 1: Open page & verify location FIRST
+      const locationOk = await verifyLocation(page);
+      if (!locationOk) {
+        log('Skipping cycle — location not verified');
+        continue;
+      }
+
+      // If CORS was blocked during location verify, reload to retry
+      if (corsBlocked) {
+        log('⚠️ GeoComply CORS blocked — reloading page to retry location...');
+        try { await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }); } catch {}
+        await new Promise(r => setTimeout(r, 8000));
+        corsBlocked = false;
+        const retryLoc = await verifyLocation(page);
+        if (!retryLoc) {
+          log('❌ Location still failing after reload — skipping cycle');
+          continue;
+        }
+      }
+
+      // Step 1b: ENSURE LOGIN before scanning
+      const loggedIn = await ensureLoggedIn(page);
+      if (!loggedIn) {
+        log('⚠️ Could not log in — retrying cycle');
+        continue;
+      }
+
+      // Step 1c: Check balance — need at least $0.10 to place a bet
+      const balance = await getBalance(page);
+      if (balance !== null) {
+        log(`💰 Balance: $${balance.toFixed(2)}`);
+        if (balance < 0.10) {
+          log(`⚠️ Balance too low ($${balance.toFixed(2)}) — money tied up in positions, skipping cycle`);
+          continue;
+        }
+      }
+
+      // Step 2: Wait for sport tabs to render (SPA loads header first, content later)
+      let visibleTabs = await getVisibleSportTabs(page);
+      if (visibleTabs.length === 0) {
+        log('Waiting for sport tabs to render...');
+        // Navigate directly to live page with subcategory to force content load
+        try {
+          await page.goto('https://sportsbook.draftkings.com/live?category=live-in-game&subcategory=basketball',
+            { waitUntil: 'domcontentloaded', timeout: 15000 });
+        } catch {}
+        await new Promise(r => setTimeout(r, 3000));
+        // Poll for sport tabs up to 15s
+        for (let w = 0; w < 15; w++) {
+          await new Promise(r => setTimeout(r, 1000));
+          visibleTabs = await getVisibleSportTabs(page).catch(() => []);
+          if (visibleTabs.length > 0) break;
+        }
+      }
+
+      if (visibleTabs.length === 0) {
+        log('⚠️ No sport tabs after waiting — reloading page...');
+        try { await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+        await new Promise(r => setTimeout(r, 5000));
+        continue;
+      }
+
+      // Hard gate: never start scanning unless location is currently verified
+      await ensureLocationVerified(page);
+      log('✅ Location re-verified before scan');
+
+      let locationLostDuringScan = false;
+
+      let orderedTabs = [...visibleTabs];
+      const bIndex = orderedTabs.findIndex(t => t.text.toUpperCase() === 'BASKETBALL');
+      if (bIndex > 0) {
+        orderedTabs = [orderedTabs[bIndex], ...orderedTabs.slice(0, bIndex), ...orderedTabs.slice(bIndex + 1)];
+      }
+      log(`Visible sport tabs (scan order): ${orderedTabs.map(t => t.text).join(', ')}`);
+
+      // Only scan these sports
+      const ALLOW_TABS = new Set(['BASKETBALL', 'NBA', 'BASEBALL', 'MLB', 'FOOTBALL', 'NFL']);
+
+      // Step 3: Clear slip, scan all 3 sports, accumulate up to 20 legs, submit ONE parlay
+      await clearBetSlip(page);
+      await new Promise(r => setTimeout(r, 500));
+
+      const allPicks = [];
+      const addedGames = new Set();
+
+      for (const tab of orderedTabs) {
+        if (allPicks.length >= MAX_LEGS) break;
+
+        if (!ALLOW_TABS.has(tab.text.toUpperCase())) {
+          log(`Skipping ${tab.text}`);
+          continue;
+        }
+
+        if (await isLocationBlocked(page)) {
+          log('⚠️ Location blocked — stopping scan');
+          locationLostDuringScan = true;
+          break;
+        }
+
+        log(`Scanning ${tab.text}...`);
+        const tabClicked = await clickVisibleSportTab(page, tab.text, tab);
+        if (!tabClicked) {
+          log(`  Could not click tab: ${tab.text}`);
+          continue;
+        }
+
+        const games = await scrapeGames(page);
+        log(`  ${games.length} live game(s)`);
+
+        for (const game of games) {
+          if (allPicks.length >= MAX_LEGS) break;
+          const gameKey = [game.team1, game.team2].sort().join('|').toLowerCase();
+          if (addedGames.has(gameKey)) continue;
+
+          const pick = pickOU(game, tab.text);
+          if (!pick) continue;
+
+          log(`  🖱️ ${pick.team} ${pick.points} @ ${pick.odds} — ${game.team1} vs ${game.team2} [${game.league || '?'}]`);
+          const clicked = await clickMoneyline(page, pick);
+          if (clicked) {
+            logBet(`  Added: ${pick.team} ${pick.points} @ ${pick.odds} [line=${pick.totalLine}]`);
+            allPicks.push(pick);
+            addedGames.add(gameKey);
+            await new Promise(r => setTimeout(r, 300));
+          } else {
+            log(`  ❌ Could not click O/U for ${game.team1} vs ${game.team2}`);
+          }
+        }
+      }
+
+      if (locationLostDuringScan) {
+        await clearBetSlip(page);
+        continue;
+      }
+
+      log(`\nTotal legs: ${allPicks.length}`);
+
+      if (allPicks.length === 0) {
+        log('No + O/U picks found across all sports — skipping');
+        await clearBetSlip(page);
+        continue;
+      }
+
+      // Switch to Parlay tab only when 2+ legs; single bet stays as-is
+      if (allPicks.length >= 2) {
+        await switchToParlayTab(page);
+        await new Promise(r => setTimeout(r, 500));
+      }
+
+      // Enter wager and place
+      await enterWager(page, PARLAY_WAGER);
+      await new Promise(r => setTimeout(r, 300));
+
+      // Scroll to top, then place bet
+      await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+      await new Promise(r => setTimeout(r, 200));
+
+      const placed = await clickPlaceBet(page);
+      if (!placed) {
+        log('⚠️ Could not place bet — waiting 10s');
+        await screenshot(page, 'no-place-btn');
+        await clearBetSlip(page);
+        await new Promise(r => setTimeout(r, 10000));
+        continue;
+      }
+
+      const betType = allPicks.length === 1 ? 'SINGLE' : `${allPicks.length}-leg PARLAY`;
+      logBet(`🎯 PLACED ${betType} O/U @ $${PARLAY_WAGER}!`);
+      await new Promise(r => setTimeout(r, 1500));
+
+      const entry = {
+        ts: new Date().toISOString(),
+        type: allPicks.length === 1 ? 'O/U-SINGLE' : 'O/U-PARLAY',
+        legs: allPicks.length,
+        wager: PARLAY_WAGER,
+        picks: allPicks.map(p => `${p.label || p.team} (${p.team1} vs ${p.team2})`),
+      };
+      try { appendFileSync(PARLAY_LOG, JSON.stringify(entry) + '\n'); } catch {}
+      logBet(`Logged ${entry.legs} legs`);
+
+      let confirmed = false;
+      for (let ci = 0; ci < 5 && !confirmed; ci++) {
+        confirmed = await page.evaluate(() => {
+          const bodyText = (document.body?.innerText || '').toLowerCase();
+          return bodyText.includes('bet placed') || bodyText.includes('bet confirmed') ||
+                 bodyText.includes('bet receipt') || bodyText.includes('your bet') ||
+                 bodyText.includes('receipt') || bodyText.includes('successfully placed') ||
+                 bodyText.includes('wager placed');
+        }).catch(() => false);
+        if (!confirmed) await new Promise(r => setTimeout(r, 400));
+      }
+      logBet(confirmed ? '✅ Bet confirmed!' : '⚠️ Confirmation not detected — may still have placed');
+
+      await closeBetReceipt(page);
+      try {
+        await page.goto('https://sportsbook.draftkings.com/live?category=live-in-game&subcategory=basketball',
+          { waitUntil: 'domcontentloaded', timeout: 30000 });
+      } catch {}
+      await new Promise(r => setTimeout(r, 2000));
+      await clearBetSlip(page);
+
+    } catch (e) {
+      log(`Cycle error: ${e.message}`);
+      await screenshot(page, 'error').catch(() => {});
+    }
+
+    // ─── 30-min Scans: DISABLED (O/U-only mode) ─────────────────────────────
+    // Structured/ML/Spread scans are disabled while running O/U-only strategy.
+    // Code preserved for later re-enablement.
+    // if (now - lastStructuredRun >= STRUCTURED_INTERVAL) { ... }
+
+    // Wait before next cycle
+    log(`⏳ Sleeping ${SCAN_INTERVAL / 1000}s until next O/U scan...`);
+    await new Promise(r => setTimeout(r, SCAN_INTERVAL));
+  }
+}
+
+main().catch(e => { log(`Fatal: ${e.message}`); process.exit(1); });
