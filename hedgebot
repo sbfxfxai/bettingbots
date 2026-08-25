@@ -1,0 +1,854 @@
+#!/usr/bin/env node
+// ─── DraftKings Live Hedge Bot ───────────────────────────────────────────────
+// Strategy:
+//   1. Scan live TENNIS every 30s.
+//   2. For each game with at least one + ML side: place $0.10 on that side.
+//   3. Keep monitoring — if the other side ever goes +, bet that too (hedge).
+//   4. Once both sides are covered, profit is guaranteed regardless of outcome.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import puppeteer from 'puppeteer-core';
+import { resolve } from 'path';
+import { mkdirSync, appendFileSync, writeFileSync, existsSync, readFileSync } from 'fs';
+import { execSync, spawn } from 'child_process';
+
+// ─── Config ──────────────────────────────────────────────────────────────────
+const CHROME_PATH   = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
+const DEBUG_PORT    = 9223;
+const USER_DATA_DIR = resolve('./browser-data-draftkings');
+const SCREENSHOTS   = resolve('./screenshots-hedge');
+const WAGER         = 0.10;
+const SCAN_INTERVAL = 30 * 1000;
+const LOG_FILE      = resolve('./hedge-history.jsonl');
+const STATE_FILE    = resolve('./hedge-state.json');
+const DK_EMAIL      = 'pamo8020@gmail.com';
+const DK_PASSWORD   = '$Richpamo12';
+const TENNIS_URL    = 'https://sportsbook.draftkings.com/live?category=live-in-game&subcategory=tennis';
+
+mkdirSync(SCREENSHOTS, { recursive: true });
+
+// ─── Selectors ────────────────────────────────────────────────────────────────
+const SEL = {
+  gameBlock:       '.cb-market__template',
+  gameBlockFilter: '.cb-market__label-inner',
+  teamName:        '.cb-market__label-inner',
+  oddsButton:      'button.cb-market__button',
+  oddsValue:       '.cb-market__button-odds',
+  oddsPoints:      '.cb-market__button-points',
+  oddsTitle:       '.cb-market__button-title',
+  collapsed:       'button.lp-collapsible-section[aria-expanded="false"], button[aria-expanded="false"].sportsbook-collapsible-section, .sportsbook-expandable-header[aria-expanded="false"]',
+};
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function log(msg)    { console.log(`[${new Date().toISOString()}] ${msg}`); }
+function logBet(msg) { console.log(`[${new Date().toISOString()}] 🎲 ${msg}`); }
+function parseOdds(str) {
+  if (!str) return NaN;
+  const n = parseInt(str.replace(/[\u2212\u2013]/g, '-').replace(/[^\-\d]/g, ''), 10);
+  return isNaN(n) ? NaN : n;
+}
+async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+async function screenshot(page, tag) {
+  try {
+    await page.screenshot({ path: resolve(SCREENSHOTS, `${new Date().toISOString().replace(/[:.]/g, '-')}-${tag}.png`), fullPage: false });
+  } catch {}
+}
+
+// ─── State ────────────────────────────────────────────────────────────────────
+let tracked = {};
+function loadState() {
+  try { if (existsSync(STATE_FILE)) tracked = JSON.parse(readFileSync(STATE_FILE, 'utf8')); } catch {}
+}
+function saveState() {
+  try { writeFileSync(STATE_FILE, JSON.stringify(tracked, null, 2)); } catch {}
+}
+function logEntry(obj) {
+  try { appendFileSync(LOG_FILE, JSON.stringify(obj) + '\n'); } catch {}
+}
+
+// ─── Browser ──────────────────────────────────────────────────────────────────
+const CHROME_ARGS = [
+  `--remote-debugging-port=${DEBUG_PORT}`,
+  `--user-data-dir=${USER_DATA_DIR}`,
+  '--no-first-run', '--no-default-browser-check',
+  '--disable-popup-blocking', '--disable-default-apps', '--disable-sync',
+  '--window-size=1280,900',
+  '--disable-features=BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessRespectPreflightResults,PrivateNetworkAccessChecks',
+];
+function spawnChrome(url) {
+  spawn(CHROME_PATH, [...CHROME_ARGS, url], { detached: true, stdio: 'ignore' }).unref();
+}
+function killChrome() {
+  try { execSync(`for /f "tokens=5" %a in ('netstat -aon ^| findstr :${DEBUG_PORT}') do taskkill /F /PID %a`, { shell: 'cmd.exe', stdio: 'ignore' }); } catch {}
+}
+async function connectBrowser() {
+  let browser;
+  for (let i = 0; i < 3; i++) {
+    try {
+      browser = await puppeteer.connect({ browserURL: `http://127.0.0.1:${DEBUG_PORT}`, defaultViewport: null });
+      log('Connected to Chrome on port ' + DEBUG_PORT); break;
+    } catch {
+      if (i === 0) { log('Spawning Chrome...'); spawnChrome(TENNIS_URL); await sleep(5000); }
+      else await sleep(3000);
+    }
+  }
+  if (!browser) {
+    killChrome(); await sleep(2000); spawnChrome(TENNIS_URL); await sleep(6000);
+    browser = await puppeteer.connect({ browserURL: `http://127.0.0.1:${DEBUG_PORT}`, defaultViewport: null });
+  }
+  const pages = await browser.pages();
+  let page = pages.find(p => { try { return !p.isClosed() && p.url().includes('draftkings'); } catch { return false; } })
+          || pages.find(p => { try { return !p.isClosed(); } catch { return false; } })
+          || await browser.newPage();
+  page.setDefaultNavigationTimeout(60000);
+  page.setDefaultTimeout(30000);
+  return { browser, page };
+}
+
+// ─── Login (copied verbatim from four.mjs — proven working) ──────────────────
+async function isLoggedIn(page) {
+  const result = await page.evaluate(() => {
+    const text = (document.body?.innerText || '').toLowerCase();
+    if (text.length < 100) return { logged: false, reason: 'page_too_short' };
+    const negatives = [
+      'log in to place bets', 'sign in to place bets',
+      'log in to place', 'sign in to place',
+      'want to start placing bets', 'must be logged in',
+      'sign in to your account', 'log in to your account',
+      'sign in to get started',
+    ];
+    const negHit = negatives.find(p => text.includes(p));
+    if (negHit) return { logged: false, reason: `negative: "${negHit}"` };
+    for (const el of document.querySelectorAll('a, button, span')) {
+      const t = (el.textContent || '').trim().toLowerCase();
+      if (t.length > 20) continue;
+      if (t === 'sign in' || t === 'log in') {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) return { logged: false, reason: `button: "${t}"` };
+      }
+    }
+    if (/balance[^a-z]*\$\d+/i.test(document.body?.innerText || '')) return { logged: true, reason: 'balance_dollar' };
+    if (text.includes('my bets') && !text.includes('sign in') && !text.includes('log in')) return { logged: true, reason: 'my_bets_no_signin' };
+    if (text.includes('last login:')) return { logged: true, reason: 'last_login_text' };
+    for (const el of document.querySelectorAll('a, button, span, div')) {
+      const t = (el.textContent || '').trim().toLowerCase();
+      if (t.length > 20) continue;
+      if (t === 'sign out' || t === 'log out' || t === 'logout' || t === 'signout') return { logged: true, reason: `found: "${t}"` };
+    }
+    if (text.length > 2000 && text.includes('deposit') && !text.includes('sign in') && !text.includes('log in')) return { logged: true, reason: 'deposit_no_signin' };
+    return { logged: false, reason: 'no_indicator' };
+  }).catch(() => ({ logged: false, reason: 'error' }));
+  if (result.logged) log(`  🔓 isLoggedIn=true (${result.reason})`);
+  return result.logged;
+}
+
+async function detectNotLoggedIn(page) {
+  return page.evaluate(() => {
+    const text = (document.body?.innerText || '').toLowerCase();
+    if (text.length < 50) return { notLoggedIn: false, loading: true };
+    for (const el of document.querySelectorAll('a, button, span')) {
+      const t = (el.textContent || '').trim().toLowerCase();
+      if (t.length > 30) continue;
+      if (t === 'sign in' || t === 'log in' || t === 'sign up' || t === 'create account') {
+        const rect = el.getBoundingClientRect();
+        // Must be a real button — wide enough, tall enough, not a tiny nav link
+        if (rect.width > 60 && rect.height > 25) return { notLoggedIn: true, reason: t };
+      }
+    }
+    if (/want to start placing bets|must be logged in|sign in to your account/i.test(text)) return { notLoggedIn: true, reason: 'text_prompt' };
+    return { notLoggedIn: false, loading: text.length < 500 };
+  }).catch(() => ({ notLoggedIn: false, loading: true }));
+}
+
+async function performLogin(page) {
+  const currentUrl = page.url();
+  const onLoginPage = currentUrl.includes('auth/login') || currentUrl.includes('myaccount.draftkings.com');
+  if (!onLoginPage) {
+    log('  Clicking "Sign In" to open login page...');
+    try {
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
+        page.evaluate(() => {
+          for (const el of document.querySelectorAll('a, button, span')) {
+            const t = (el.textContent || '').trim().toLowerCase();
+            if (t === 'sign in' || t === 'log in') { el.click(); return true; }
+          }
+          return false;
+        })
+      ]);
+    } catch {}
+    await sleep(3000);
+  }
+  log('  Waiting for login form...');
+  let formFound = false;
+  for (let w = 0; w < 20; w++) {
+    formFound = await page.evaluate(() => !!(
+      document.querySelector('#login-username-input') ||
+      document.querySelector('input[type="email"]') ||
+      document.querySelector('input[type="text"]')
+    )).catch(() => false);
+    if (formFound) break;
+    await sleep(1000);
+  }
+  // Fill email via React setter
+  const emailFilled = await page.evaluate((email) => {
+    const selectors = ['#login-username-input', 'input[type="email"]', 'input[name="Email"]', 'input[autocomplete="email"]', 'input[autocomplete="username"]'];
+    for (const sel of selectors) {
+      const input = document.querySelector(sel);
+      if (!input) continue;
+      const rect = input.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+      input.focus(); input.value = '';
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(input, email);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      return sel;
+    }
+    return null;
+  }, DK_EMAIL).catch(() => null);
+
+  if (emailFilled) {
+    log(`  Email filled via: ${emailFilled}`);
+    await sleep(500);
+    const pwFilled = await page.evaluate((pw) => {
+      const input = document.querySelector('#login-password-input') || document.querySelector('input[type="password"]');
+      if (!input) return false;
+      input.focus(); input.value = '';
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(input, pw);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    }, DK_PASSWORD).catch(() => false);
+    if (pwFilled) {
+      log('  Password filled — clicking submit...');
+      await sleep(300);
+      try {
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
+          page.evaluate(() => {
+            for (const el of document.querySelectorAll('button[type="submit"], button')) {
+              const t = (el.textContent || '').trim().toLowerCase();
+              if (t === 'log in' || t === 'sign in' || t === 'submit' || t === 'login') { el.click(); return true; }
+            }
+            return false;
+          })
+        ]);
+      } catch {}
+      log('  DOM login submitted');
+    }
+  } else {
+    // Keyboard fallback
+    log('  DOM fill failed — keyboard fallback...');
+    const inputPos = await page.evaluate(() => {
+      for (const input of document.querySelectorAll('input[type="email"], input[type="text"]')) {
+        const r = input.getBoundingClientRect();
+        if (r.width > 30 && r.height > 10) { input.focus(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; }
+      }
+      return null;
+    }).catch(() => null);
+    if (inputPos) {
+      await page.mouse.click(inputPos.x, inputPos.y);
+      await sleep(200);
+      await page.keyboard.down('Control'); await page.keyboard.press('a'); await page.keyboard.up('Control');
+      await page.keyboard.press('Backspace');
+      await page.keyboard.type(DK_EMAIL, { delay: 20 });
+      await page.keyboard.press('Tab');
+      await sleep(200);
+      await page.keyboard.down('Control'); await page.keyboard.press('a'); await page.keyboard.up('Control');
+      await page.keyboard.press('Backspace');
+      await page.keyboard.type(DK_PASSWORD, { delay: 20 });
+      await page.keyboard.press('Enter');
+      log('  Keyboard login submitted');
+    }
+  }
+  await sleep(10000);
+  if (!page.url().includes('sportsbook.draftkings.com/live')) {
+    try { await page.goto('https://sportsbook.draftkings.com/live', { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+    await sleep(5000);
+  }
+}
+
+async function ensureLoggedIn(page) {
+  log('🔑 Checking login status...');
+  for (let attempt = 0; attempt < 15; attempt++) {
+    if (await isLoggedIn(page)) { log('✅ Logged in to DraftKings — confirmed'); return true; }
+    const detection = await detectNotLoggedIn(page);
+    log(`  Login attempt ${attempt + 1}/15: notLoggedIn=${detection.notLoggedIn}, reason=${detection.reason || 'n/a'}, loading=${detection.loading || false}`);
+    if (detection.notLoggedIn) {
+      await performLogin(page);
+      await sleep(3000);
+      if (await isLoggedIn(page)) { log('✅ Logged in — confirmed after auto-login'); return true; }
+    } else if (detection.loading) {
+      if (attempt === 3 || attempt === 7) { page.goto(TENNIS_URL).catch(() => {}); }
+      await sleep(5000);
+    } else {
+      await performLogin(page);
+      await sleep(3000);
+      if (await isLoggedIn(page)) { log('✅ Logged in — confirmed after login'); return true; }
+    }
+  }
+  log('⚠️ Auto-login exhausted — please log in manually in the browser');
+  for (let w = 0; w < 120; w++) {
+    if (await isLoggedIn(page)) { log('✅ Manual login detected — resuming'); return true; }
+    if (w % 12 === 0 && w > 0) log(`  Waiting for manual login... (${w * 5}s)`);
+    await sleep(5000);
+  }
+  return false;
+}
+
+// ─── Location (copied verbatim from four.mjs — proven working) ───────────────
+async function isLocationBlocked(page) {
+  return page.evaluate(() => {
+    const t = (document.body?.innerText || '').toLowerCase();
+    if (t.includes('trouble verifying your location') || t.includes('verifying your location') ||
+        t.includes('you are in a location where betting is unavailable') ||
+        t.includes('checking location') || t.includes('location where betting')) return true;
+    for (const el of document.querySelectorAll('div, section, aside, [role="alert"], [role="banner"], span, p')) {
+      const text = (el.textContent || '').trim().toLowerCase();
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 200 || rect.height < 20 || rect.height > 120) continue;
+      if (text.includes('trouble verifying') || text.includes('verifying your location') ||
+          text.includes('required to bet') || text.includes('location where betting')) return true;
+    }
+    return false;
+  }).catch(() => true);
+}
+
+async function clickRecheckLocation(page) {
+  const bannerInfo = await page.evaluate(() => {
+    for (const el of document.querySelectorAll('div, section, aside, a, [role="alert"], [role="banner"]')) {
+      const text = (el.textContent || '').toLowerCase();
+      if (!text.includes('location') && !text.includes('verifying')) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.height < 10 || rect.height > 200 || rect.width < 200) continue;
+      if (rect.y < 0 || rect.y > 500) continue;
+      return { x: rect.x, y: rect.y, w: rect.width, h: rect.height };
+    }
+    return null;
+  }).catch(() => null);
+  if (!bannerInfo) { log('  No location banner found'); return null; }
+  const clickX = bannerInfo.x + bannerInfo.w - 30;
+  const clickY = bannerInfo.y + bannerInfo.h / 2;
+  log(`  Clicking banner at (${Math.round(clickX)}, ${Math.round(clickY)})`);
+  await page.mouse.click(clickX, clickY);
+  await sleep(2000);
+  await page.mouse.click(bannerInfo.x + bannerInfo.w / 2, clickY);
+  log('  Location recheck clicked');
+  await sleep(8000);
+  if (!page.url().includes('/live')) {
+    try { await page.goto(TENNIS_URL, { waitUntil: 'domcontentloaded', timeout: 20000 }); } catch {}
+    await sleep(5000);
+  }
+  return 'mouse';
+}
+
+async function ensureLocationVerified(page) {
+  let attempt = 0;
+  while (true) {
+    if (!await isLocationBlocked(page)) return true;
+    attempt++;
+    const phase = ((attempt - 1) % 4) + 1;
+    log(`⚠️ Location blocked (attempt ${attempt}, strategy ${phase}/4)`);
+    if (attempt <= 3 || attempt % 5 === 0) await screenshot(page, `geo-blocked-${attempt}`);
+    if (phase === 1) {
+      const clicked = await clickRecheckLocation(page);
+      if (!clicked) log('  No recheck element found');
+      await sleep(5000);
+    } else if (phase === 2) {
+      log('  🔄 Hard reload...');
+      try { await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+      await sleep(12000);
+    } else if (phase === 3) {
+      log('  🔄 Full re-navigation...');
+      try { await page.goto('https://sportsbook.draftkings.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+      await sleep(8000);
+      try { await page.goto(TENNIS_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+      await sleep(12000);
+    } else {
+      await clickRecheckLocation(page);
+      await sleep(15000);
+    }
+  }
+}
+
+// ─── ensureReady: login + geo — always ends on tennis page ────────────────────
+async function ensureReady(page) {
+  // Ensure page has some content before checking login
+  const contentLen = await page.evaluate(() => (document.body?.innerText || '').length).catch(() => 0);
+  if (contentLen < 200) {
+    log('Page empty — navigating to DK live...');
+    try { await page.goto(TENNIS_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+    await sleep(5000);
+  }
+  // 1. Login
+  await ensureLoggedIn(page);
+  // 2. Location — must be after login
+  await ensureLocationVerified(page);
+  log('✅ Login + location OK');
+  // 3. Always land on tennis page when done
+  if (!page.url().includes('tennis')) {
+    log('  Navigating to tennis page...');
+    try { await page.goto(TENNIS_URL, { waitUntil: 'domcontentloaded', timeout: 20000 }); } catch {}
+    await sleep(4000);
+    // Re-check geo after navigation (DK re-triggers it on each page load)
+    await ensureLocationVerified(page);
+  }
+  log('✅ Ready on tennis page');
+}
+
+// ─── Scrape live games (with scroll-through for virtual list) ─────────────────
+async function scrapeTennisGames(page) {
+  // Expand collapsed sections
+  await page.evaluate((sel) => {
+    document.querySelectorAll(sel).forEach(b => b.click());
+  }, SEL.collapsed).catch(() => {});
+  await sleep(200);
+
+  // Scroll to top first
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  await sleep(100);
+
+  const allGames = [];
+  const seen = new Set();
+
+  // Scroll through entire page accumulating games
+  for (let pass = 0; pass < 30; pass++) {
+    const viewport = await page.evaluate((sel) => {
+      const results = [];
+      const blocks = Array.from(document.querySelectorAll(sel.gameBlock))
+        .filter(b => b.querySelector(sel.gameBlockFilter));
+
+      for (const block of blocks) {
+        const rect = block.getBoundingClientRect();
+        if (rect.width === 0 || rect.x >= 700) continue;
+
+        // Teams
+        const teams = [];
+        block.querySelectorAll(sel.teamName).forEach(el => {
+          const name = (el.textContent || '').trim();
+          if (name && name.length > 1) teams.push(name);
+        });
+        if (teams.length < 2) continue;
+
+        // All odds buttons
+        const odds = [];
+        block.querySelectorAll(sel.oddsButton).forEach((btn, idx) => {
+          const val   = (btn.querySelector(sel.oddsValue)  || btn).textContent.trim();
+          const title = (btn.querySelector(sel.oddsTitle)  || { textContent: '' }).textContent.trim();
+          const pts   = (btn.querySelector(sel.oddsPoints) || { textContent: '' }).textContent.trim();
+          odds.push({ val, title, pts, idx });
+        });
+
+        // Filter to moneyline only (no O/U title, no spread points)
+        const ml = odds.filter(o => {
+          const t = o.title.toUpperCase();
+          const p = o.pts.trim();
+          if (t === 'O' || t === 'U' || t === 'OVER' || t === 'UNDER') return false;
+          if (p.startsWith('+') || p.startsWith('-')) return false;
+          return true;
+        });
+
+        if (ml.length < 2) continue;
+
+        results.push({
+          team1: teams[0], team2: teams[1],
+          ml1: { odds: ml[0].val, idx: ml[0].idx },
+          ml2: { odds: ml[ml.length - 1].val, idx: ml[ml.length - 1].idx },
+          allOddsDebug: odds.slice(0, 6).map(o => `[${o.title}|${o.pts}|${o.val}]`).join(' '),
+        });
+      }
+      return results;
+    }, SEL).catch(() => []);
+
+    let added = 0;
+    for (const g of viewport) {
+      const key = [g.team1, g.team2].sort().join('|').toLowerCase();
+      if (!seen.has(key)) { seen.add(key); allGames.push(g); added++; }
+    }
+
+    // Scroll down one viewport
+    const atBottom = await page.evaluate(() => {
+      window.scrollBy(0, window.innerHeight * 0.8);
+      return window.scrollY + window.innerHeight >= document.body.scrollHeight - 50;
+    }).catch(() => true);
+    await sleep(200);
+
+    if (atBottom && added === 0) break;
+    if (atBottom) break;
+  }
+
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  return allGames;
+}
+
+// ─── Click a game's ML odds button (scrolls game into view first) ─────────────
+async function clickMLButton(page, team1, team2, buttonIdx) {
+  // First scroll the game into view
+  await page.evaluate((t1, t2, sel) => {
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+    const blocks = Array.from(document.querySelectorAll(sel.gameBlock))
+      .filter(b => b.querySelector(sel.gameBlockFilter));
+    const block = blocks.find(b => {
+      const names = Array.from(b.querySelectorAll(sel.teamName)).map(el => norm(el.textContent));
+      return names.includes(norm(t1)) && names.includes(norm(t2));
+    });
+    if (block) block.scrollIntoView({ block: 'center', behavior: 'instant' });
+  }, team1, team2, SEL).catch(() => {});
+  await sleep(300);
+
+  // Now click by index
+  return page.evaluate((t1, t2, idx, sel) => {
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+    const blocks = Array.from(document.querySelectorAll(sel.gameBlock))
+      .filter(b => b.querySelector(sel.gameBlockFilter));
+    const block = blocks.find(b => {
+      const names = Array.from(b.querySelectorAll(sel.teamName)).map(el => norm(el.textContent));
+      return names.includes(norm(t1)) && names.includes(norm(t2));
+    });
+    if (!block) return null;
+    const buttons = block.querySelectorAll(sel.oddsButton);
+    if (idx >= 0 && idx < buttons.length) { buttons[idx].click(); return 'clicked'; }
+    return null;
+  }, team1, team2, buttonIdx, SEL);
+}
+
+// ─── Bet slip helpers (proven from four.mjs) ──────────────────────────────────
+async function clearBetSlip(page) {
+  await page.evaluate(() => {
+    for (const el of document.querySelectorAll('button, [role="button"], a, span, div')) {
+      const t = (el.textContent || '').trim().toLowerCase();
+      if (t === 'clear all' || t === 'remove suspended picks' || t === 'remove suspended' ||
+          t === 'remove closed picks' || t === 'remove closed') el.click();
+    }
+  }).catch(() => {});
+  await sleep(600);
+  await page.evaluate(() => {
+    for (const el of document.querySelectorAll('button, [role="button"], a, span, div')) {
+      const t = (el.textContent || '').trim().toLowerCase();
+      if (t === 'clear all' || t === 'yes' || t === 'confirm') { el.click(); return; }
+    }
+  }).catch(() => {});
+  await sleep(400);
+}
+
+async function closeBetReceipt(page) {
+  for (let i = 0; i < 4; i++) {
+    const closed = await page.evaluate(() => {
+      for (const el of document.querySelectorAll('button, [role="button"], a, span, div')) {
+        const t = (el.textContent || '').trim().toLowerCase();
+        if (t.length > 30) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0 || r.x < 500) continue;
+        if (t === 'close' || t === 'done' || t === '×' || t === 'x' || t === 'ok' || t === 'got it') {
+          el.click(); return t;
+        }
+      }
+      return null;
+    }).catch(() => null);
+    if (closed) { await sleep(300); return; }
+    await sleep(400);
+  }
+  await clearBetSlip(page);
+}
+
+// ─── Enter wager (proven React setter approach from four.mjs) ─────────────────
+async function enterWager(page, amount) {
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    // Find any visible input on the right-side bet slip
+    const inputPos = await page.evaluate(() => {
+      for (const input of document.querySelectorAll('input')) {
+        const r = input.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0 || r.width > 250 || r.x < 600) continue;
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+      }
+      return null;
+    }).catch(() => null);
+
+    if (!inputPos) {
+      log(`  No wager input found (attempt ${attempt}/3)`);
+      await sleep(600);
+      continue;
+    }
+
+    // Click 3x to select all, then type
+    await page.mouse.click(inputPos.x, inputPos.y, { clickCount: 3 });
+    await sleep(50);
+    await page.keyboard.press('Backspace');
+    await page.keyboard.type(amount.toString(), { delay: 30 });
+
+    // React setter to ensure value registers
+    await page.evaluate(({ x, y, amt }) => {
+      const el = document.elementFromPoint(x, y);
+      if (!el || el.tagName !== 'INPUT') return;
+      try {
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        setter.call(el, amt);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      } catch {}
+    }, { x: inputPos.x, y: inputPos.y, amt: amount.toString() });
+    await page.keyboard.press('Tab');
+    await sleep(300);
+    log(`  ✅ Wager set: $${amount}`);
+    return true;
+  }
+  log('  ❌ Could not set wager');
+  return false;
+}
+
+// ─── Place a single straight bet ──────────────────────────────────────────────
+async function placeSingleBet(page, team1, team2, side, odds, buttonIdx) {
+  log(`  → Clearing bet slip`);
+  await clearBetSlip(page);
+  await sleep(500);
+
+  log(`  → Clicking ${side} @ ${odds} (button index ${buttonIdx})`);
+  const clicked = await clickMLButton(page, team1, team2, buttonIdx);
+  if (!clicked) {
+    log(`  ❌ clickMLButton returned null for ${team1} vs ${team2} idx=${buttonIdx}`);
+    await screenshot(page, 'click-fail');
+    return false;
+  }
+  await sleep(1500);
+
+  // Step 1: Expand collapsed bet slip drawer (DK hides it at the bottom)
+  await page.evaluate(() => {
+    for (const el of document.querySelectorAll('div, button, [role="button"], a, span')) {
+      const t = (el.textContent || '').trim().toLowerCase();
+      const r = el.getBoundingClientRect();
+      if ((t.includes('bet slip') || t.includes('betslip')) && r.y > 500 && r.height < 80 && r.width > 200) {
+        el.click(); return true;
+      }
+    }
+    return false;
+  }).catch(() => false);
+  await sleep(1000);
+
+  // Step 2: Remove suspended/closed picks
+  for (let i = 0; i < 3; i++) {
+    const removed = await page.evaluate(() => {
+      for (const el of document.querySelectorAll('button, [role="button"], a')) {
+        const t = (el.textContent || '').trim().toLowerCase();
+        if (t.length < 80 && (t.includes('remove suspended') || t.includes('remove closed'))) {
+          el.click(); return true;
+        }
+      }
+      return false;
+    }).catch(() => false);
+    if (!removed) break;
+    await sleep(500);
+  }
+
+  // Step 3: Accept odds change notices
+  await page.evaluate(() => {
+    for (const el of document.querySelectorAll('button, [role="button"]')) {
+      const t = (el.textContent || '').trim().toLowerCase();
+      if (t.includes('accept') || t.includes('got it')) { el.click(); return; }
+    }
+  }).catch(() => {});
+  await sleep(300);
+
+  // Step 4: Enter wager
+  log(`  → Entering wager $${WAGER}`);
+  await enterWager(page, WAGER);
+  await sleep(500);
+
+  // Step 5: Accept odds changes again after wager entry
+  await page.evaluate(() => {
+    for (const el of document.querySelectorAll('button, [role="button"]')) {
+      const t = (el.textContent || '').trim().toLowerCase();
+      if (t.includes('accept') || t.includes('got it')) { el.click(); return; }
+    }
+  }).catch(() => {});
+  await sleep(300);
+
+  // Step 6: Scroll to top so bet slip is fully visible
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  await sleep(300);
+
+  // Step 7: Click Place Bet
+  log(`  → Clicking Place Bet`);
+  const placed = await page.evaluate(() => {
+    for (const el of document.querySelectorAll('button, [role="button"]')) {
+      const t = (el.textContent || '').trim().toLowerCase();
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0 || r.x < 600) continue;
+      if (t === 'place bet' || t.startsWith('place bet') || t.includes('accept & place')) {
+        el.scrollIntoView({ block: 'center', behavior: 'instant' });
+        el.click();
+        return t.slice(0, 40);
+      }
+    }
+    // Log all visible right-side buttons for debugging
+    const btns = [];
+    for (const el of document.querySelectorAll('button, [role="button"]')) {
+      const r = el.getBoundingClientRect();
+      if (r.x > 600 && r.width > 0 && r.height > 0) btns.push((el.textContent || '').trim().slice(0, 30));
+    }
+    return { notFound: true, btns };
+  }).catch(() => null);
+
+  if (!placed || (placed && placed.notFound)) {
+    const btns = placed?.btns || [];
+    log(`  ❌ Place Bet button not found. Right-side buttons: [${btns.join(' | ')}]`);
+    await screenshot(page, 'no-place-btn');
+    await clearBetSlip(page);
+    return false;
+  }
+
+  await sleep(2500);
+  await closeBetReceipt(page);
+  logBet(`✅ Placed $${WAGER} on ${side} @ ${odds} — ${team1} vs ${team2}`);
+  return true;
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+async function main() {
+  log('═══════════════════════════════════════════════');
+  log('DraftKings Live Hedge Bot — TENNIS');
+  log(`Wager: $${WAGER} | Scan: every ${SCAN_INTERVAL / 1000}s`);
+  log('═══════════════════════════════════════════════\n');
+
+  loadState();
+  log(`Restored ${Object.keys(tracked).length} tracked game(s) from state`);
+
+  const { page } = await connectBrowser();
+
+  // Navigate to tennis live page
+  log('Navigating to tennis live page...');
+  try { await page.goto(TENNIS_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+  await sleep(4000);
+
+  // Ensure logged in and location verified before starting
+  await ensureReady(page);
+  log('✅ Ready — starting bet cycles');
+
+  let cycle = 0;
+  while (true) {
+    cycle++;
+    log(`\n─── Cycle ${cycle} ─────────────────────────────────`);
+
+    try {
+      // Ensure on tennis page — ensureReady already ran at startup or after each bet nav
+      if (!page.url().includes('tennis')) {
+        log('Not on tennis page — navigating + re-verifying...');
+        try { await page.goto(TENNIS_URL, { waitUntil: 'domcontentloaded', timeout: 20000 }); } catch {}
+        await sleep(3000);
+        await ensureReady(page);
+      }
+
+      const games = await scrapeTennisGames(page);
+      log(`Scraped ${games.length} live tennis game(s)`);
+      if (games.length === 0) {
+        // Debug: log raw DOM info
+        const info = await page.evaluate(() => ({
+          url: location.href,
+          bodyLen: (document.body?.innerText || '').length,
+          blockCount: document.querySelectorAll('.cb-market__template').length,
+        })).catch(() => ({}));
+        log(`  [debug] url=${info.url} bodyLen=${info.bodyLen} blocks=${info.blockCount}`);
+      }
+
+      // Process every game from the current scrape.
+      // After each bet we navigate back to tennis — the game block is re-rendered
+      // in the fresh DOM so clickMLButton finds it without a separate re-scrape.
+      for (const game of games) {
+        const { team1, team2, ml1, ml2, allOddsDebug } = game;
+        const key = [team1, team2].sort().join('|').toLowerCase();
+        const o1 = parseOdds(ml1.odds);
+        const o2 = parseOdds(ml2.odds);
+        const p1 = !isNaN(o1) && o1 > 0;
+        const p2 = !isNaN(o2) && o2 > 0;
+
+        log(`  ${team1}(${ml1.odds}) vs ${team2}(${ml2.odds}) | debug: ${allOddsDebug}`);
+
+        // ── Not yet tracked → place initial bet ─────────────────────────────
+        if (!tracked[key]) {
+          if (!p1 && !p2) { log(`    No + odds — skip`); continue; }
+
+          let side, oddsStr, idx;
+          if (p1 && p2) {
+            if (o1 <= o2) { side = team1; oddsStr = ml1.odds; idx = ml1.idx; }
+            else          { side = team2; oddsStr = ml2.odds; idx = ml2.idx; }
+          } else if (p1) { side = team1; oddsStr = ml1.odds; idx = ml1.idx; }
+          else           { side = team2; oddsStr = ml2.odds; idx = ml2.idx; }
+
+          logBet(`NEW: ${team1} vs ${team2} — betting ${side} @ ${oddsStr}`);
+          const ok = await placeSingleBet(page, team1, team2, side, oddsStr, idx);
+
+          if (ok) {
+            tracked[key] = {
+              team1, team2,
+              betA: { side, odds: oddsStr, ts: new Date().toISOString() },
+              betB: null, hedged: false,
+            };
+            saveState();
+            logEntry({ ts: new Date().toISOString(), event: 'initial_bet', game: key, side, odds: oddsStr, wager: WAGER });
+          }
+
+          // Navigate back to tennis after each bet so DOM is ready for next game
+          try { await page.goto(TENNIS_URL, { waitUntil: 'domcontentloaded', timeout: 20000 }); } catch {}
+          await sleep(3000);
+          // No break — continue to next game
+          continue;
+        }
+
+        // ── Already tracked — check for hedge opportunity ───────────────────
+        const state = tracked[key];
+        if (state.hedged) { log(`    Already hedged ✅`); continue; }
+
+        const betASideIsTeam1 = state.betA.side === team1;
+        const oppOdds    = betASideIsTeam1 ? o2 : o1;
+        const oppSide    = betASideIsTeam1 ? team2 : team1;
+        const oppOddsStr = betASideIsTeam1 ? ml2.odds : ml1.odds;
+        const oppIdx     = betASideIsTeam1 ? ml2.idx : ml1.idx;
+
+        if (!isNaN(oppOdds) && oppOdds > 0) {
+          logBet(`HEDGE: ${oppSide} @ ${oppOddsStr} — betting now!`);
+          const ok = await placeSingleBet(page, team1, team2, oppSide, oppOddsStr, oppIdx);
+
+          if (ok) {
+            state.betB = { side: oppSide, odds: oppOddsStr, ts: new Date().toISOString() };
+            state.hedged = true;
+            saveState();
+            logEntry({ ts: new Date().toISOString(), event: 'hedge_bet', game: key, side: oppSide, odds: oppOddsStr, wager: WAGER });
+            logBet(`✅ FULLY HEDGED: ${team1} vs ${team2} — profit locked in!`);
+          }
+
+          // Navigate back and continue to next game
+          try { await page.goto(TENNIS_URL, { waitUntil: 'domcontentloaded', timeout: 20000 }); } catch {}
+          await sleep(3000);
+          continue;
+        } else {
+          log(`    Monitoring: waiting for ${oppSide} to go + (currently ${oppOddsStr})`);
+        }
+      }
+
+      // Clean up finished games (no longer in DOM)
+      const live = new Set(games.map(g => [g.team1, g.team2].sort().join('|').toLowerCase()));
+      for (const key of Object.keys(tracked)) {
+        if (!live.has(key)) {
+          const s = tracked[key];
+          const outcome = s.hedged ? 'hedged' : 'unhedged';
+          log(`  Game ended (${outcome}): ${s.team1} vs ${s.team2}`);
+          logEntry({ ts: new Date().toISOString(), event: `game_ended_${outcome}`, game: key, betA: s.betA, betB: s.betB });
+          delete tracked[key];
+          saveState();
+        }
+      }
+
+    } catch (e) {
+      log(`Cycle error: ${e.message}\n${e.stack?.split('\n')[1] || ''}`);
+      await screenshot(page, 'error');
+    }
+
+    log(`⏳ Sleeping ${SCAN_INTERVAL / 1000}s...`);
+    await sleep(SCAN_INTERVAL);
+  }
+}
+
+main().catch(e => { log(`Fatal: ${e.message}`); process.exit(1); });
